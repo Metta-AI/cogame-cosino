@@ -132,17 +132,15 @@ proc eval5*(cards: openArray[int]): int =
     return packRank(HandPair, [pairs[0], singles[0], singles[1], singles[2]])
   packRank(HandHighCard, singles)
 
-proc evalBest*(cards: openArray[int]): int =
-  ## Best five-card rank from five, six, or seven cards. Twenty-one
+proc bestFive*(cards: openArray[int]): tuple[rank: int, five: seq[int]] =
+  ## Best five-card rank from five, six, or seven cards, plus the five
+  ## cards that make it (for showdown highlighting). Twenty-one
   ## combinations at worst; a poker hand evaluates a handful of times per
   ## showdown, so brute force is plenty.
   assert cards.len >= 5 and cards.len <= 7
   if cards.len == 5:
-    return eval5(cards)
+    return (eval5(cards), @cards)
   var five: array[5, int]
-  var chosen = newSeq[int](cards.len)
-  for index in 0 ..< cards.len:
-    chosen[index] = index
   ## Iterate all 5-subsets via the two indices left out.
   for dropA in 0 ..< cards.len:
     let lastDrop = if cards.len == 7: cards.len else: dropA + 1
@@ -157,8 +155,11 @@ proc evalBest*(cards: openArray[int]): int =
           inc slot
       if slot == 5:
         let value = eval5(five)
-        if value > result:
-          result = value
+        if value > result.rank:
+          result = (value, @five)
+
+proc evalBest*(cards: openArray[int]): int =
+  bestFive(cards).rank
 
 proc handCategory*(packed: int): int = packed shr 20
 

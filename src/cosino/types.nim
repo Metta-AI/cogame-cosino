@@ -52,6 +52,7 @@ type
     hand*: int          ## 0-based hand this event belongs to
     seat*: int          ## acting seat; -1 for board/handEnd events
     cards*: seq[int]    ## deal / board / reveal cards
+    best*: seq[int]     ## reveal events: the five cards making the hand
     amount*: int        ## chips moved (blind, action delta, pot award)
     action*: ActionKind ## action events only
     allIn*: bool        ## action/blind left the actor with an empty stack
@@ -81,7 +82,7 @@ proc defaultGameConfig*(): GameConfig =
     startingStack: 100,
     smallBlind: 1,
     bigBlind: 2,
-    hands: 30,
+    hands: 20,
     turnDelayMs: 900,
     playerConnectTimeoutSeconds: 180,
     model: "claude-sonnet-5",

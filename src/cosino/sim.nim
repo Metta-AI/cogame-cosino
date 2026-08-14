@@ -19,8 +19,10 @@ const
   ## An episode's whole model-call allowance (one call per player action).
   ## A hosted episode is killed if it outlives the platform's artifact
   ## timeout, so the budget sits on the episode: `hands` is capped at
-  ## sample time by the expected calls per hand at this seat count.
-  EpisodeCallBudget* = 240
+  ## sample time by the expected calls per hand at this seat count. Sized
+  ## so the standard 20-hand match fits even at a six-seat table
+  ## (20 hands x 14 expected calls).
+  EpisodeCallBudget* = 320
   MinHands* = 2
   MaxSeats* = 6
   ## Total spectator-pacing sleep an episode may spend, in milliseconds.
@@ -171,6 +173,7 @@ proc addEvent(
   kind: EventKind,
   seat: int,
   cards: seq[int] = @[],
+  best: seq[int] = @[],
   amount = 0,
   action = akFold,
   allIn = false,
@@ -184,6 +187,7 @@ proc addEvent(
     hand: sim.hand,
     seat: seat,
     cards: cards,
+    best: best,
     amount: amount,
     action: action,
     allIn: allIn,
@@ -311,10 +315,11 @@ proc resolveHand(sim: var Sim) =
     var seat = sim.nextIn(sim.button)
     for _ in 0 ..< sim.liveCount():
       let hole = sim.seats[seat].holeCards
-      ranks[seat] = evalBest(hole & sim.board)
+      let (rank, five) = bestFive(hole & sim.board)
+      ranks[seat] = rank
       sim.seats[seat].revealed = true
-      sim.addEvent(evReveal, seat, cards = hole,
-        text = describeRank(ranks[seat]))
+      sim.addEvent(evReveal, seat, cards = hole, best = five,
+        text = describeRank(rank))
       seat = sim.nextIn(seat)
 
     ## The live seats' commitment levels slice the pot: everyone pays into
@@ -858,6 +863,11 @@ proc eventToJson*(event: GameEvent): JsonNode =
     for card in event.cards:
       cardsNode.add(%card)
     result["cards"] = cardsNode
+  if event.best.len > 0:
+    var bestNode = newJArray()
+    for card in event.best:
+      bestNode.add(%card)
+    result["best"] = bestNode
   if event.amount != 0:
     result["amount"] = %event.amount
   if event.kind == evAction:
@@ -889,5 +899,8 @@ proc eventFromJson*(node: JsonNode): GameEvent =
   if node.hasKey("cards"):
     for card in node["cards"]:
       result.cards.add(card.getInt())
+  if node.hasKey("best"):
+    for card in node["best"]:
+      result.best.add(card.getInt())
   if node.hasKey("action"):
     result.action = parseEnum[ActionKind](node["action"].getStr())

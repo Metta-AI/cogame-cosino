@@ -40,6 +40,16 @@ aliases back to policy names; results are reported under policy names.
 
 ```bash
 export PATH="$HOME/.nimby/nim/bin:$PATH"
+nimby --global sync nimby.lock                 # fetch pinned packages
+# Generate nim.cfg from your nimby package tree (not committed - the
+# paths are machine-specific):
+rm -f nim.cfg
+for pkg in ~/.nimby/pkgs/*; do
+  if [ -d "$pkg/src" ]; then echo "--path:\"$pkg/src\"" >> nim.cfg;
+  else echo "--path:\"$pkg\"" >> nim.cfg; fi
+done
+echo '--path:"src"' >> nim.cfg
+
 nim r --path:src tests/test_sim.nim            # rules tests
 nim r --path:src tests/test_bot.nim            # scripted-baseline tests
 nim c -d:release -o:bin/cosino src/cosino.nim

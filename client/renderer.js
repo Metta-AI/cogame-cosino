@@ -32,7 +32,12 @@
   var FELT_EDGE = "#1d3f2b";
   var CARD_RED = "#c0392b";
   var BUBBLE_MS = 5200;
-  var FLASH_MS = 2200;
+  // The winner's scoop: a long telescoping arm reaches from the cog to the
+  // pot, the claw closes, and the arm drags the chips home.
+  var SCOOP_MS = 2000;
+  var SCOOP_EXTEND = 0.35;   // arm reaching out
+  var SCOOP_GRAB = 0.5;      // claw closing on the pile
+  var SCOOP_RETRACT = 0.85;  // dragging the chips back; then the +N floats
 
   var RANKS = "23456789TJQKA";
   var SUITS = ["♣", "♦", "♥", "♠"];
@@ -267,11 +272,14 @@
     var chh = CARD_H * layout.scale * 1.25;
     var gap = 6 * layout.scale;
     var startX = layout.cx - (5 * cw + 4 * gap) / 2 + cw / 2;
+    var highlight = view.highlight || {};
+    var highlighting = Object.keys(highlight).length > 0;
     for (var slot = 0; slot < 5; slot++) {
       var cardX = startX + slot * (cw + gap);
       if (slot < board.length) {
+        var lit = !!highlight[board[slot]];
         drawCardFace(ctx, cardX, layout.cy - 8 * layout.scale, cw, chh,
-          board[slot], 1);
+          board[slot], highlighting && !lit ? 0.5 : 1, 0, lit);
       } else {
         // Empty slot outline, so the board reads as five-card even preflop.
         ctx.save();
@@ -283,26 +291,6 @@
         ctx.restore();
       }
     }
-    // Award flashes: winning chips announce themselves at the winner.
-    (view.flashes || []).forEach(function (flash) {
-      var age = now - flash.at;
-      if (age > FLASH_MS) return;
-      var pos = seatPosition(flash.seat, count, layout);
-      var spot = alongCenter(pos, layout, layout.size * 1.2);
-      var alpha = Math.max(0, 1 - age / FLASH_MS);
-      var rise = (age / FLASH_MS) * 26 * layout.scale;
-      ctx.save();
-      ctx.globalAlpha = alpha;
-      ctx.font = "700 " + Math.round(16 * layout.scale) +
-        "px 'rajdhani', system-ui, sans-serif";
-      ctx.textAlign = "center";
-      ctx.fillStyle = AMBER;
-      ctx.shadowColor = "rgba(0,0,0,0.9)";
-      ctx.shadowBlur = 5;
-      ctx.fillText("+" + flash.amount, spot.x, spot.y - rise);
-      ctx.restore();
-    });
-
     // Seats.
     seats.forEach(function (seat, index) {
       var pos = seatPosition(index, count, layout);
@@ -395,7 +383,7 @@
           var tilt = (c === 0 ? -1 : 1) * 0.06;
           if (faceUp) {
             drawCardFace(ctx, spot.x + offset, spot.y, hw, hh, cards[c],
-              1, tilt);
+              1, tilt, !!(view.highlight || {})[cards[c]]);
           } else {
             drawCardBack(ctx, spot.x + offset, spot.y, hw, hh,
               COLOR_HEX[color], tilt);
@@ -403,8 +391,10 @@
         }
       }
 
-      // Chips bet this street, closer to the felt.
-      if (seat.bet > 0) {
+      // Chips bet this street, closer to the felt. Once the hand is
+      // decided the bets have been raked into the pot — stale chips in
+      // front of the seats would misread as live action.
+      if (seat.bet > 0 && view.handLive && view.street !== "showdown") {
         var betSpot = feltEdgePoint(pos, layout, feltRx, feltRy,
           26 * scale);
         ctx.save();
@@ -428,6 +418,10 @@
     });
 
     // The pot, over everything on the felt so it always reads.
+    var potSpot = {
+      x: layout.cx,
+      y: layout.cy + chh / 2 + 12 * layout.scale
+    };
     if (view.pot > 0 || board.length > 0) {
       ctx.save();
       ctx.font = "700 " + Math.round(15 * layout.scale) +
@@ -436,10 +430,28 @@
       ctx.fillStyle = AMBER;
       ctx.shadowColor = "rgba(0,0,0,0.8)";
       ctx.shadowBlur = 4;
-      ctx.fillText("POT " + (view.pot || 0), layout.cx,
-        layout.cy + chh / 2 + 12 * layout.scale);
+      ctx.fillText("POT " + (view.pot || 0), potSpot.x, potSpot.y);
       ctx.restore();
     }
+
+    // Showdown verdicts: what each tabled hand actually was, pinned by
+    // its cards until the next deal.
+    Object.keys(view.handLabels || {}).forEach(function (key) {
+      var index = +key;
+      if (index >= seats.length) return;
+      var pos = seatPosition(index, count, layout);
+      var spot = alongCenter(pos, layout,
+        layout.size * 1.3 + (CARD_H / 2 + 13) * layout.scale);
+      drawHandTag(ctx, spot.x, spot.y, view.handLabels[key],
+        COLOR_HEX[seatColor(index)], layout.scale);
+    });
+
+    // Winner scoops, over the pot they are robbing.
+    (view.scoops || []).forEach(function (scoop) {
+      var age = now - scoop.at;
+      if (age > SCOOP_MS) return;
+      drawScoop(ctx, scoop, age / SCOOP_MS, count, layout, potSpot);
+    });
 
     // Speech bubbles (drawn last, on top).
     (view.bubbles || []).forEach(function (bubble) {
@@ -452,17 +464,141 @@
     });
   }
 
-  function drawCardFace(ctx, x, y, cw, chh, card, alpha, tilt) {
+  function easeOut(t) { return 1 - (1 - t) * (1 - t); }
+  function easeIn(t) { return t * t; }
+
+  // A small verdict tag ("a flush, ace high") in the seat's color.
+  function drawHandTag(ctx, x, y, text, accent, scale) {
+    ctx.save();
+    ctx.font = "700 " + Math.round(11 * scale) +
+      "px 'rajdhani', system-ui, sans-serif";
+    var label = text.toUpperCase();
+    var pad = 6 * scale;
+    var bw = ctx.measureText(label).width + pad * 2;
+    var bh = 17 * scale;
+    ctx.fillStyle = "rgba(242, 232, 216, 0.95)";
+    ctx.strokeStyle = accent;
+    ctx.lineWidth = 2;
+    roundRect(ctx, x - bw / 2, y - bh / 2, bw, bh, 4 * scale);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = INK;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(label, x, y + scale);
+    ctx.restore();
+  }
+
+  function drawScoop(ctx, scoop, t, count, layout, potSpot) {
+    var pos = seatPosition(scoop.seat, count, layout);
+    var color = COLOR_HEX[seatColor(scoop.seat)];
+    var scale = layout.scale;
+    // Shoulder: the cog's near edge, facing the pot.
+    var shoulder = alongCenter(pos, layout, layout.size * 0.42);
+    var span = {
+      x: potSpot.x - shoulder.x,
+      y: potSpot.y - 6 * scale - shoulder.y
+    };
+
+    // How far the claw has reached: out, hold to grab, then haul it home.
+    var reach;
+    if (t < SCOOP_EXTEND) {
+      reach = easeOut(t / SCOOP_EXTEND);
+    } else if (t < SCOOP_GRAB) {
+      reach = 1;
+    } else if (t < SCOOP_RETRACT) {
+      reach = 1 - easeIn((t - SCOOP_GRAB) / (SCOOP_RETRACT - SCOOP_GRAB));
+    } else {
+      reach = 0;
+    }
+    var tip = {
+      x: shoulder.x + span.x * reach,
+      y: shoulder.y + span.y * reach
+    };
+    var hauling = t >= SCOOP_GRAB && reach > 0.02;
+
+    if (reach > 0.02) {
+      // Telescoping arm: three tapering segments, cog-colored.
+      var angle = Math.atan2(tip.y - shoulder.y, tip.x - shoulder.x);
+      ctx.save();
+      ctx.lineCap = "round";
+      for (var seg = 0; seg < 3; seg++) {
+        var a = seg / 3;
+        var b = (seg + 1) / 3;
+        ctx.strokeStyle = seg % 2 ? "#3a3128" : color;
+        ctx.lineWidth = (9 - seg * 2.4) * scale;
+        ctx.beginPath();
+        ctx.moveTo(shoulder.x + (tip.x - shoulder.x) * a,
+          shoulder.y + (tip.y - shoulder.y) * a);
+        ctx.lineTo(shoulder.x + (tip.x - shoulder.x) * b,
+          shoulder.y + (tip.y - shoulder.y) * b);
+        ctx.stroke();
+      }
+      // The claw: two fingers, open on the way out, clamped on the haul.
+      var open = hauling ? 0.22 : 0.65;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 3.4 * scale;
+      [-1, 1].forEach(function (side) {
+        ctx.beginPath();
+        ctx.arc(tip.x, tip.y, 8 * scale,
+          angle + side * open - (side > 0 ? 0 : Math.PI * 0.9),
+          angle + side * open + (side > 0 ? Math.PI * 0.9 : 0));
+        ctx.stroke();
+      });
+      // The haul: a little pile of chips gripped in the claw.
+      if (hauling) {
+        var chipSpots = [[0, 0], [-6, -4], [6, -3], [-2, -8]];
+        chipSpots.forEach(function (offset, i) {
+          ctx.beginPath();
+          ctx.arc(tip.x + offset[0] * scale, tip.y + offset[1] * scale,
+            4.6 * scale, 0, Math.PI * 2);
+          ctx.fillStyle = i % 2 ? AMBER : PAPER;
+          ctx.fill();
+          ctx.strokeStyle = "rgba(0,0,0,0.55)";
+          ctx.lineWidth = 1;
+          ctx.stroke();
+        });
+      }
+      ctx.restore();
+    }
+
+    // The winnings land: "+N" floats up from the cog.
+    if (t >= SCOOP_RETRACT) {
+      var doneT = (t - SCOOP_RETRACT) / (1 - SCOOP_RETRACT);
+      ctx.save();
+      ctx.globalAlpha = 1 - doneT;
+      ctx.font = "700 " + Math.round(17 * scale) +
+        "px 'rajdhani', system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillStyle = AMBER;
+      ctx.shadowColor = "rgba(0,0,0,0.9)";
+      ctx.shadowBlur = 5;
+      ctx.fillText("+" + scoop.amount, shoulder.x,
+        shoulder.y - (8 + doneT * 22) * scale);
+      ctx.restore();
+    }
+  }
+
+  function drawCardFace(ctx, x, y, cw, chh, card, alpha, tilt, glow) {
     ctx.save();
     ctx.translate(x, y);
     if (tilt) ctx.rotate(tilt);
     ctx.globalAlpha = alpha == null ? 1 : alpha;
     ctx.fillStyle = PAPER;
-    ctx.strokeStyle = "rgba(42, 31, 22, 0.8)";
-    ctx.lineWidth = 1.5;
+    if (glow) {
+      // Part of the hand that took the pot.
+      ctx.shadowColor = AMBER;
+      ctx.shadowBlur = 14;
+      ctx.strokeStyle = AMBER;
+      ctx.lineWidth = 3;
+    } else {
+      ctx.strokeStyle = "rgba(42, 31, 22, 0.8)";
+      ctx.lineWidth = 1.5;
+    }
     roundRect(ctx, -cw / 2, -chh / 2, cw, chh, cw * 0.13);
     ctx.fill();
     ctx.stroke();
+    ctx.shadowBlur = 0;
     ctx.fillStyle = suitColor(card);
     ctx.textAlign = "center";
     ctx.font = "700 " + Math.round(chh * 0.38) +
@@ -738,30 +874,68 @@
   function makeEffects() {
     var seen = 0;
     var bubbles = [];
-    var flashes = [];
+    var scoops = [];
+    var handLabels = {};
+    var bestFives = {};
+    var highlight = {};
     return {
-      absorb: function (events) {
+      // `quiet` (a scrub jump): the whole prefix lands at once, so only
+      // the newest events get to animate — replaying every historical
+      // pot award as a fresh scoop would fill the table with arms.
+      absorb: function (events, quiet) {
         var now = Date.now();
         for (; seen < events.length; seen++) {
           var event = events[seen];
+          var animate = !quiet || seen >= events.length - 2;
+          if (event.kind === "handStart") {
+            handLabels = {};
+            bestFives = {};
+            highlight = {};
+          } else if (event.kind === "reveal") {
+            // The showdown verdict: pinned to the seat until the next deal.
+            handLabels[event.seat] = event.text || "";
+            bestFives[event.seat] = event.best || [];
+          } else if (event.kind === "award" && event.text !== "returned" &&
+              bestFives[event.seat]) {
+            // The cards that actually took the pot light up.
+            bestFives[event.seat].forEach(function (card) {
+              highlight[card] = true;
+            });
+          }
           if (event.kind === "say") {
+            if (!animate) continue;
             bubbles = bubbles.filter(function (b) {
               return b.seat !== event.seat;
             });
             bubbles.push({ seat: event.seat, text: event.text, at: now });
           } else if (event.kind === "award" && event.text !== "returned") {
-            flashes.push({ seat: event.seat, amount: event.amount, at: now });
+            if (!animate) continue;
+            // One scoop per winner: a second pot for the same seat in the
+            // same beat folds into the arm already reaching out.
+            var merged = false;
+            scoops.forEach(function (scoop) {
+              if (scoop.seat === event.seat && now - scoop.at < 300) {
+                scoop.amount += event.amount;
+                merged = true;
+              }
+            });
+            if (!merged) {
+              scoops.push({ seat: event.seat, amount: event.amount,
+                at: now });
+            }
           }
         }
-        var cutoff = now - Math.max(BUBBLE_MS, FLASH_MS);
+        var cutoff = now - Math.max(BUBBLE_MS, SCOOP_MS);
         bubbles = bubbles.filter(function (b) { return b.at > cutoff; });
-        flashes = flashes.filter(function (f) { return f.at > cutoff; });
+        scoops = scoops.filter(function (s) { return s.at > cutoff; });
       },
       reset: function () {
-        seen = 0; bubbles = []; flashes = [];
+        seen = 0; bubbles = []; scoops = [];
+        handLabels = {}; bestFives = {}; highlight = {};
       },
       view: function () {
-        return { bubbles: bubbles, flashes: flashes };
+        return { bubbles: bubbles, scoops: scoops,
+          handLabels: handLabels, highlight: highlight };
       }
     };
   }
@@ -899,6 +1073,7 @@
     view.board = state.board;
     view.pot = state.pot;
     view.button = state.button;
+    view.street = state.street;
     view.handLive = !state.handDone;
     view.now = Date.now();
     Object.assign(view, extras || {});
@@ -1089,7 +1264,7 @@
         if (jumped) {
           effects.reset();
         }
-        effects.absorb(events.slice(0, index));
+        effects.absorb(events.slice(0, index), jumped);
         if (options.feed) renderFeed(options.feed, events, nameMap, index);
         if (options.label) {
           options.label.textContent = index + " / " + events.length;
@@ -1105,9 +1280,13 @@
       setIndex(0, true);
 
       (function frame(timestamp) {
-        var next = events[index];
-        var stepMs = next && next.kind === "say" ? 1500 :
-          next && (next.kind === "board" || next.kind === "reveal") ? 1200 :
+        // Dwell on what the viewer is currently looking at — the event
+        // just absorbed — so bubbles get read and the winner's scoop arm
+        // gets to play out before the next beat.
+        var shown = index > 0 ? events[index - 1] : null;
+        var stepMs = shown && shown.kind === "say" ? 1500 :
+          shown && (shown.kind === "board" || shown.kind === "reveal") ? 1200 :
+          shown && shown.kind === "award" && shown.text !== "returned" ? 1900 :
           700;
         if (playing && index < events.length &&
             timestamp - lastStep > stepMs) {

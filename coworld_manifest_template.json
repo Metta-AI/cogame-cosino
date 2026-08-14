@@ -97,7 +97,7 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 500,
-          "default": 30
+          "default": 20
         },
         "turnDelayMs": {
           "description": "Spectator pacing delay between actions.",
@@ -327,7 +327,7 @@
         "startingStack": 100,
         "smallBlind": 1,
         "bigBlind": 2,
-        "hands": 30,
+        "hands": 20,
         "turnDelayMs": 900,
         "player_connect_timeout_seconds": 180
       }
@@ -349,7 +349,7 @@
         "startingStack": 100,
         "smallBlind": 1,
         "bigBlind": 2,
-        "hands": 40,
+        "hands": 20,
         "turnDelayMs": 900,
         "player_connect_timeout_seconds": 180
       }

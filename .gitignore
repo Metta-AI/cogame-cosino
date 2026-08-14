@@ -1,0 +1,5 @@
+bin/
+tmp/
+dist/
+replay-viewer/dist/nimcache/
+*.replay

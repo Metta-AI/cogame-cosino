@@ -44,7 +44,12 @@
 
   function cardRank(card) { return Math.floor(card / 4); }
   function cardSuit(card) { return card % 4; }
-  function cardLabel(card) { return RANKS[cardRank(card)]; }
+  function cardLabel(card) {
+    // Viewers get "10" like a real deck; "T" is poker shorthand the bots
+    // use in their prompts, not something a casual spectator should need.
+    var rank = RANKS[cardRank(card)];
+    return rank === "T" ? "10" : rank;
+  }
   function suitGlyph(card) { return SUITS[cardSuit(card)]; }
   function suitColor(card) {
     var suit = cardSuit(card);
@@ -601,10 +606,13 @@
     ctx.shadowBlur = 0;
     ctx.fillStyle = suitColor(card);
     ctx.textAlign = "center";
-    ctx.font = "700 " + Math.round(chh * 0.38) +
+    var label = cardLabel(card);
+    // "10" is two glyphs where every other rank is one; shrink it a notch
+    // so it stays inside the card frame.
+    ctx.font = "700 " + Math.round(chh * (label.length > 1 ? 0.32 : 0.38)) +
       "px 'rajdhani', system-ui, sans-serif";
     ctx.textBaseline = "alphabetic";
-    ctx.fillText(cardLabel(card), 0, -chh * 0.08);
+    ctx.fillText(label, 0, -chh * 0.08);
     ctx.font = Math.round(chh * 0.4) + "px system-ui, sans-serif";
     ctx.fillText(suitGlyph(card), 0, chh * 0.34);
     ctx.restore();

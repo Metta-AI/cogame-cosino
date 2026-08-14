@@ -1,0 +1,397 @@
+{
+  "$schema": "https://raw.githubusercontent.com/Metta-AI/coworld/main/src/coworld/coworld_manifest_schema.json",
+  "tags": [
+    "poker",
+    "cards",
+    "llm-driven",
+    "no-limit-holdem",
+    "turn-based"
+  ],
+  "game": {
+    "name": "cosino",
+    "replay_viewer": {
+      "bundle": "static-replay-viewer"
+    },
+    "description": "Cosino: no-limit Texas Hold'em for 2-6 cogs. Every seat buys in for the same stack (default 100 chips, blinds 1/2); the match plays a fixed number of hands and the final CHIP SHARE is the score, so protecting a short stack counts as much as building a tower. Full no-limit rules: min-raises, all-ins, side pots, split pots; busted cogs are out for good (no rebuys). Seats play under anonymous cog aliases so nobody can meta-game a familiar policy name. The game is LLM-driven: each turn the game server sends the acting seat's policy prompt plus its private cards and the public table state to Claude, so A POLICY IS JUST A PROMPT - build one by reusing the published player runnable and setting the PLAYER_PROMPT environment variable to your poker strategy (hand selection, bet sizing, table talk, tells). A built-in rule-based baseline (Chen-formula preflop, pot-odds postflop) plays any seat that registers as scripted - and every seat when no LLM credentials are available, so episodes always complete.",
+    "owner": "daveey@gmail.com",
+    "runnable": {
+      "type": "game",
+      "image": "{{COSINO_IMAGE}}",
+      "run": [
+        "/bin/cosino"
+      ],
+      "env": {
+        "ANTHROPIC_API_KEY_URI": "secret://coworld/cosino/anthropic_api_key"
+      },
+      "source_url": "https://github.com/Metta-AI/cogame-cosino/tree/main"
+    },
+    "config_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tokens",
+        "players"
+      ],
+      "properties": {
+        "tokens": {
+          "description": "One connection token per player slot, indexed by slot.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 6,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "players": {
+          "description": "One player display-name object per seat, indexed by slot.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 6,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "num_agents": {
+          "description": "Seat count; injected by the commissioner.",
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 6
+        },
+        "seed": {
+          "description": "Pins the shuffle, the button, and the seat aliases. Omit for a fresh random seed per episode.",
+          "type": "integer"
+        },
+        "startingStack": {
+          "description": "Chips each seat buys in for.",
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 100000,
+          "default": 100
+        },
+        "smallBlind": {
+          "description": "Small blind.",
+          "type": "integer",
+          "minimum": 1,
+          "default": 1
+        },
+        "bigBlind": {
+          "description": "Big blind; must exceed the small blind.",
+          "type": "integer",
+          "minimum": 2,
+          "default": 2
+        },
+        "hands": {
+          "description": "Hand limit for the episode (capped by the model-call budget for the seat count; the match also ends when one cog holds every chip).",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500,
+          "default": 30
+        },
+        "turnDelayMs": {
+          "description": "Spectator pacing delay between actions.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000,
+          "default": 900
+        },
+        "model": {
+          "description": "Claude model that drives every seat.",
+          "type": "string",
+          "default": "claude-sonnet-5"
+        },
+        "maxOutputTokens": {
+          "type": "integer",
+          "minimum": 64,
+          "maximum": 2000,
+          "default": 300
+        },
+        "llmTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 5,
+          "maximum": 300,
+          "default": 45
+        },
+        "player_connect_timeout_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "default": 180
+        }
+      }
+    },
+    "results_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "names",
+        "scores",
+        "win",
+        "stacks",
+        "handsWon",
+        "busted",
+        "handsPlayed",
+        "hands",
+        "startingStack",
+        "smallBlind",
+        "bigBlind"
+      ],
+      "properties": {
+        "names": {
+          "description": "Policy display names, indexed by slot. Seats play under anonymous cog aliases in-game; results attribute by policy name.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 6,
+          "items": {
+            "type": "string"
+          }
+        },
+        "scores": {
+          "description": "Final chip share per seat (stack / total chips in play): in [0,1], summing to 1, comparable across episodes whatever the seat count.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 6,
+          "items": {
+            "type": "number"
+          }
+        },
+        "win": {
+          "description": "True for the seat(s) holding the biggest final stack.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 6,
+          "items": {
+            "type": "boolean"
+          }
+        },
+        "stacks": {
+          "description": "Final chip count per seat.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 6,
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "handsWon": {
+          "description": "Hands in which the seat won chips from a pot.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 6,
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "busted": {
+          "description": "True for seats that lost their whole stack.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 6,
+          "items": {
+            "type": "boolean"
+          }
+        },
+        "handsPlayed": {
+          "description": "Hands actually completed this episode.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "hands": {
+          "description": "The episode's hand limit after budget fitting.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "startingStack": {
+          "type": "integer"
+        },
+        "smallBlind": {
+          "type": "integer"
+        },
+        "bigBlind": {
+          "type": "integer"
+        }
+      }
+    },
+    "protocols": {
+      "player": {
+        "type": "text",
+        "value": "cosino.player.v1 - JSON text frames over the websocket named by COWORLD_PLAYER_WS_URL (already carrying ?slot=N&token=T). A Cosino policy is a prompt: the player container's only job is to deliver it; the game server makes every decision by sending that prompt plus the seat's private cards and the public table state to Claude each turn. game->player frames: {\"type\":\"welcome\",\"protocol\":\"cosino.player.v1\",\"slot\":N,\"name\":str,\"startingStack\":int,\"smallBlind\":int,\"bigBlind\":int,\"hands\":int} on connect; {\"type\":\"state\",\"slot\":N,\"seats\":[{name,stack,bet,cards,revealed,folded,allIn,out,acting,handsWon}],\"board\":[...],\"pot\":int,\"events\":[...],\"done\":bool,...} after every action (hole cards other than your own are redacted until a showdown reveals them; cards are ints 0-51, rank=card div 4 with 0=deuce..12=ace, suit=card mod 4 as clubs/diamonds/hearts/spades); {\"type\":\"final\",\"done\":true,\"scores\":[...],\"win\":[...],\"names\":[...]} at game end, after which the player should exit. player->game frames: {\"type\":\"prompt\",\"prompt\":str,\"scripted\":bool} (prompt max 4000 chars; send after connect and again after welcome; the latest frame applies to all later turns; scripted:true plays the built-in rule-based baseline for this seat instead of the LLM). The published cosino-player runnable reads its prompt from the PLAYER_PROMPT environment variable (PLAYER_SCRIPTED=1 for the scripted baseline), so a new policy is `coworld upload-policy` of the same image with --secret-env PLAYER_PROMPT=\"<your strategy>\"."
+      },
+      "global": {
+        "type": "text",
+        "value": "Global spectators connect a websocket to /global and receive the full snapshot as JSON after every action: {\"type\":\"state\",\"game\":\"cosino\",\"seats\":[{name,stack,bet,cards,revealed,folded,allIn,out,acting,handsWon}],\"board\":[ints],\"pot\":int,\"street\":str,\"hand\":int,\"button\":int,\"events\":[{kind:handStart|deal|blind|say|action|board|reveal|award|bust|handEnd,...}],\"handsPlayed\":int,\"hands\":int,\"started\":bool,\"done\":bool,\"connected\":[bool]}. Spectators see every hole card (that is the spectator's edge); the events array is append-only and carries the complete table transcript. The browser page at /client/global renders the table; /client/replay plays a recorded episode; the static replay viewer bundle renders replays hosted by the platform (index.html?replay=<url>)."
+      }
+    },
+    "docs": {
+      "readme": {
+        "type": "text",
+        "value": "Cosino is no-limit Texas Hold'em for 2-6 LLM-piloted cogs. Fixed buy-in, blinds, all-ins and side pots; a fixed number of hands; final chip share is the score and the biggest stack takes the table. A policy is just a prompt: field one by reusing the published cosino-player runnable with the PLAYER_PROMPT environment variable set to your strategy. The game server calls Claude with each seat's prompt, its private hole cards, and the public action; with no LLM credentials (or for seats that register scripted) it plays a rule-based baseline so episodes always complete."
+      },
+      "pages": [
+        {
+          "id": "rules.md",
+          "title": "rules.md",
+          "content": {
+            "type": "text",
+            "value": "# Cosino rules\n\n- Standard no-limit Texas Hold'em, 2-6 seats, one table.\n- Every seat starts with `startingStack` chips (default 100); blinds default 1/2 and never escalate.\n- The button walks clockwise each hand; heads-up, the button posts the small blind and acts first preflop.\n- Full no-limit betting: fold / check / call / bet / raise / all-in. Min-raise rules apply; a short all-in does not re-open the betting. Side pots form per commitment level; split pots share evenly with odd chips going clockwise from the button.\n- Uncalled bets return to the bettor. Folded chips stay in the pot.\n- A cog that loses its whole stack is OUT - no rebuys. Its seat folds every hand from there.\n- The match plays `hands` hands (fitted to the episode's model-call budget) or until one cog holds every chip.\n\n## Scoring\n\n`score = final stack / total chips in play` - the chip share, in [0,1], summing to 1 across seats. `win` marks the seat(s) with the biggest final stack. Every chip matters: folding a short stack to the money is real strategy, and so is pressing an edge to felt the table.\n\n## The meta\n\nEvery decision is made by Claude acting on a per-seat policy prompt plus that seat's private cards and the public table state. Seats play under anonymous cog aliases (policy names never reach the table). Table talk is public and free - bluff, needle, and mislead. Prompts that reason about pot odds, position, stack depth, and opponent patterns tend to win; a built-in scripted baseline (Chen-formula preflop, pot-odds postflop) fills seats without prompts and is a fieldable policy in its own right."
+          }
+        }
+      ]
+    }
+  },
+  "player": [
+    {
+      "id": "cosino-player",
+      "name": "Cosino Prompt Player",
+      "type": "player",
+      "description": "The reference Cosino policy: delivers its PLAYER_PROMPT (or a default solid-aggressive poker personality) to the game and spectates until the final frame. Field your own policy by uploading this same image with a different PLAYER_PROMPT.",
+      "image": "{{COSINO_IMAGE}}",
+      "run": [
+        "/bin/cosino-player"
+      ],
+      "resources": {
+        "requests": {
+          "cpu": "100m",
+          "memory": "64Mi"
+        },
+        "limits": {
+          "cpu": "1"
+        }
+      },
+      "source_url": "https://github.com/Metta-AI/cogame-cosino/tree/main"
+    },
+    {
+      "id": "cosino-shark",
+      "name": "Cosino Scripted Shark",
+      "type": "player",
+      "description": "The scripted baseline as a fieldable policy: registers its seat as rule-based (Chen-formula preflop, made-hand strength and pot odds postflop) so the game server plays it deterministically, no LLM involved.",
+      "image": "{{COSINO_IMAGE}}",
+      "run": [
+        "/bin/cosino-player"
+      ],
+      "env": {
+        "PLAYER_SCRIPTED": "1"
+      },
+      "resources": {
+        "requests": {
+          "cpu": "100m",
+          "memory": "64Mi"
+        },
+        "limits": {
+          "cpu": "1"
+        }
+      },
+      "source_url": "https://github.com/Metta-AI/cogame-cosino/tree/main"
+    }
+  ],
+  "variants": [
+    {
+      "id": "sixmax",
+      "name": "Six-max table",
+      "description": "The standard table: six cogs, 100-chip stacks, 1/2 blinds, up to 30 hands (budget-fitted). Deep enough for real poker, short enough for an episode.",
+      "game_config": {
+        "players": [
+          {
+            "name": "Player1"
+          },
+          {
+            "name": "Player2"
+          },
+          {
+            "name": "Player3"
+          },
+          {
+            "name": "Player4"
+          },
+          {
+            "name": "Player5"
+          },
+          {
+            "name": "Player6"
+          }
+        ],
+        "num_agents": 6,
+        "startingStack": 100,
+        "smallBlind": 1,
+        "bigBlind": 2,
+        "hands": 30,
+        "turnDelayMs": 900,
+        "player_connect_timeout_seconds": 180
+      }
+    },
+    {
+      "id": "headsup",
+      "name": "Heads-up",
+      "description": "Two cogs, 100-chip stacks, 1/2 blinds. Pure aggression and hand-reading; the budget affords a long match.",
+      "game_config": {
+        "players": [
+          {
+            "name": "Player1"
+          },
+          {
+            "name": "Player2"
+          }
+        ],
+        "num_agents": 2,
+        "startingStack": 100,
+        "smallBlind": 1,
+        "bigBlind": 2,
+        "hands": 40,
+        "turnDelayMs": 900,
+        "player_connect_timeout_seconds": 180
+      }
+    }
+  ],
+  "certification": {
+    "game_config": {
+      "players": [
+        {
+          "name": "Sprocket"
+        },
+        {
+          "name": "Gizmo"
+        },
+        {
+          "name": "Ratchet"
+        },
+        {
+          "name": "Widget"
+        }
+      ],
+      "seed": 7,
+      "startingStack": 60,
+      "smallBlind": 1,
+      "bigBlind": 2,
+      "hands": 8,
+      "turnDelayMs": 0,
+      "player_connect_timeout_seconds": 180
+    },
+    "players": [
+      {
+        "player_id": "cosino-player"
+      },
+      {
+        "player_id": "cosino-shark"
+      },
+      {
+        "player_id": "cosino-player"
+      },
+      {
+        "player_id": "cosino-shark"
+      }
+    ]
+  }
+}

@@ -72,6 +72,7 @@ type
     isOut*: bool           ## busted before this hand: no chips, sits out
     acted*: bool           ## has acted on the current street
     mayRaise*: bool        ## betting is open to this seat right now
+    revealed*: bool        ## hole cards tabled at showdown (public now)
     handsWon*: int
 
 proc defaultGameConfig*(): GameConfig =

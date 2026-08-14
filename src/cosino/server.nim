@@ -97,10 +97,11 @@ proc snapshotJson(gs: GameState): JsonNode =
 
 proc redactCards(snapshot: JsonNode, slot: int) =
   ## Hole cards are secret: a player sees only its own, plus whatever the
-  ## showdown made public (reveal events survive redaction). The global
-  ## viewer keeps everything — that is the spectator's edge.
+  ## showdown made public (revealed seats and reveal events survive the
+  ## redaction). The global viewer keeps everything — that is the
+  ## spectator's edge.
   for index, seat in snapshot["seats"].getElems():
-    if index != slot:
+    if index != slot and not seat{"revealed"}.getBool(false):
       seat["cards"] = newJArray()
   var visible = newJArray()
   for event in snapshot["events"]:

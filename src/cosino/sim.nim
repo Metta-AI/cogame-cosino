@@ -312,6 +312,7 @@ proc resolveHand(sim: var Sim) =
     for _ in 0 ..< sim.liveCount():
       let hole = sim.seats[seat].holeCards
       ranks[seat] = evalBest(hole & sim.board)
+      sim.seats[seat].revealed = true
       sim.addEvent(evReveal, seat, cards = hole,
         text = describeRank(ranks[seat]))
       seat = sim.nextIn(seat)
@@ -698,6 +699,7 @@ proc seatStates*(sim: Sim): JsonNode =
       "stack": seat.stack,
       "bet": seat.committed,
       "cards": cardsNode,
+      "revealed": seat.revealed,
       "folded": seat.folded,
       "allIn": seat.allIn,
       "out": seat.isOut,
@@ -727,7 +729,6 @@ type
     ## One scrub position: the reconstructed table state after an event
     ## prefix (frames[i] = state after events[0..<i]).
     seats*: seq[Seat]
-    revealed*: seq[bool]
     board*: seq[int]
     pot*: int
     street*: Street
@@ -741,7 +742,6 @@ proc replayMatch*(config: GameConfig, events: seq[GameEvent]): seq[ReplayFrame] 
   ## amounts and stacks-after, so this never re-runs the betting engine.
   let n = config.players.len
   var frame = ReplayFrame(
-    revealed: newSeq[bool](n),
     street: stPreflop,
     acting: -1,
     button: -1
@@ -767,7 +767,7 @@ proc replayMatch*(config: GameConfig, events: seq[GameEvent]): seq[ReplayFrame] 
         frame.seats[index].folded = false
         frame.seats[index].allIn = false
         frame.seats[index].holeCards = @[]
-        frame.revealed[index] = false
+        frame.seats[index].revealed = false
     of evDeal:
       frame.seats[event.seat].holeCards = event.cards
     of evBlind, evAction:
@@ -791,7 +791,7 @@ proc replayMatch*(config: GameConfig, events: seq[GameEvent]): seq[ReplayFrame] 
         frame.seats[index].committed = 0
     of evReveal:
       frame.seats[event.seat].holeCards = event.cards
-      frame.revealed[event.seat] = true
+      frame.seats[event.seat].revealed = true
       frame.street = event.street
     of evAward:
       frame.seats[event.seat].stack = event.stackAfter
@@ -824,7 +824,7 @@ proc frameStateJson*(frame: ReplayFrame): JsonNode =
       "stack": seat.stack,
       "bet": seat.committed,
       "cards": cardsNode,
-      "revealed": frame.revealed[index],
+      "revealed": seat.revealed,
       "folded": seat.folded,
       "allIn": seat.allIn,
       "out": seat.isOut,

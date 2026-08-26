@@ -167,10 +167,12 @@ for t in tests/*.nim; do nim r --hints:off --path:src "$t"; done
   the certification fixture in raw docker with **no** `ANTHROPIC_API_KEY`, so
   both seats play scripted. Uploads the replay as `smoke-replay`.
 - **`wasm-viewer`** — builds the static bundle and **executes** it in headless
-  Chromium twice: once against the smoke replay, once against the committed
-  six-max fixture `tools/ci/fixtures/sixmax_audit.replay` (two flagged pairs and
-  a full-120-rune `say` on every seat, regenerated and diffed by
-  `tests/test_sim.nim`). Both with `--soak 12 --strict-text-bounds`.
+  Chromium three times: against the smoke replay, the committed six-max
+  fixture `tools/ci/fixtures/sixmax_audit.replay` (two flagged pairs and a
+  full-120-rune `say` on every seat) and the committed chip-race fixture
+  `tools/ci/fixtures/chiprace_bust.replay` (three busts, the walking button).
+  Both fixtures are regenerated and diffed by `tests/test_sim.nim`. All with
+  `--soak 12 --strict-text-bounds`.
 
 `.github/workflows/coworld-release.yml` (dispatch) runs
 build → certify → upload policies → upload coworld → put secret, in that order,

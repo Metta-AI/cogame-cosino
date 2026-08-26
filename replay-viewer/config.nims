@@ -38,6 +38,6 @@ switch(
   -s MODULARIZE=1
   -s EXPORT_NAME=CosinoReplayModule
   -s EXPORTED_RUNTIME_METHODS=HEAPU8
-  -s EXPORTED_FUNCTIONS=_main,_malloc,_free,_cos_load_replay,_cos_payload_ptr,_cos_payload_len,_cos_error_ptr,_cos_error_len
+  -s EXPORTED_FUNCTIONS=_main,_malloc,_free,_pkr_load_replay,_pkr_payload_ptr,_pkr_payload_len,_pkr_error_ptr,_pkr_error_len
   """).replace("\n", " ")
 )

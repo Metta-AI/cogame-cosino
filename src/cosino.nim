@@ -1,5 +1,5 @@
-## Cosino entrypoint: reads the Coworld runtime contract and starts either
-## a live episode server or a replay viewer server.
+## Cosino entrypoint: reads the Coworld runtime contract and starts either a
+## live episode server or a replay viewer server.
 
 import
   std/[json, sysrand],
@@ -32,16 +32,19 @@ when isMainModule:
     var config = defaultGameConfig()
     config.update(runtimeConfig.config)
     if not seedPinned(runtimeConfig.config):
-      ## An unpinned seed is randomized so the deal (and scripted-baseline
-      ## draws) are not precomputable.
+      ## An unpinned seed is randomised so the deal, the seating and the
+      ## scripted-baseline draws are not precomputable.
       config.seed = randomSeed()
       echo "cosino: seed not pinned; randomized"
     ## Fit the table AFTER the seed is settled, so a pinned seed reproduces
     ## the episode exactly.
     config = sampleEpisode(config)
-    echo "cosino: seats=", config.players.len,
+    echo "cosino: variant=", config.variant,
+      " seats=", config.players.len,
       " stack=", config.startingStack,
+      " ante=", config.ante,
       " blinds=", config.smallBlind, "/", config.bigBlind,
       " hands=", config.hands,
+      " duplicate=", config.duplicate,
       " model=", config.model
     runGameServer(config, runtimeConfig)

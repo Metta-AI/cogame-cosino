@@ -1,32 +1,47 @@
-## Pure game rules for Cosino: no-limit Texas Hold'em. No IO, no networking,
-## no LLM — the server, the tests, and the wasm replay viewer all drive this
-## same module.
+## Pure game rules for Cosino: Kuhn, Leduc and no-limit Texas Hold'em
+## behind one `Variant`. No IO, no networking, no LLM — the server, the
+## tests, and the wasm replay viewer all drive this same module.
 ##
-## A `Sim` is one hand: blinds, four betting streets, side pots, showdown.
-## A `Match` is the episode: up to `config.hands` hands with the button
-## rotating, stacks carried between hands, and no rebuys — a busted seat
-## sits out. The score is the final chip share.
+## A `Sim` is one hand. A `Match` is the episode. On the LADDER rungs every
+## hand starts from `startingStack` chips at every seat (there are no busts
+## and no carried stacks — duplicate scoring needs both halves of a pair to
+## start identical, and the collusion audit needs every seat live all the way
+## through) and a seat's result is its cumulative NET chips. On the chip-race
+## TABLE (`config.chipRace`) stacks carry between hands, the button walks to
+## the next funded seat, a busted seat sits out for good, and the final chip
+## share is the score.
 ##
-## Events are append-only and carry amounts, cards, and stacks-after, so
-## replaying an event log is bookkeeping — the viewers never re-run the
-## betting engine.
+## Events are append-only and carry amounts, cards and stacks-after, so
+## replaying an event log is bookkeeping: the viewers never re-run the betting
+## engine. The wall-clock stop is itself a recorded event (`matchEnd`), so a
+## `deadline` replay re-derives bit-identically to a `complete` one.
 
-import std/[json, random, strutils], cards, types
+import std/[json, math, random, strutils], audit, cards, solve, types
 
-export cards, types
+export audit, cards, solve, types
 
 const
-  ## An episode's whole model-call allowance (one call per player action).
-  ## A hosted episode is killed if it outlives the platform's artifact
-  ## timeout, so the budget sits on the episode: `hands` is capped at
-  ## sample time by the expected calls per hand at this seat count. Sized
-  ## so the standard 20-hand match fits even at a six-seat table
-  ## (20 hands x 14 expected calls).
-  EpisodeCallBudget* = 320
+  ## An episode's whole model-call allowance (one call per decision). Poker is
+  ## SEQUENTIAL: one seat is on decision at a time, so the budget is per
+  ## decision, not per turn. 220 x 3.0 s = 660 s, exactly the soft guard.
+  EpisodeDecisionBudget* = 220
   MinHands* = 2
-  MaxSeats* = 6
-  ## Total spectator-pacing sleep an episode may spend, in milliseconds.
-  PacingBudgetMs* = 90_000
+  GameVersion* = 1
+  ## Share of the platform's episode timeout spent playing, and the hard stop.
+  ## The 60% bound is on the TRUE worst-case settle, and the hard guard is
+  ## checked BEFORE a decision: a decision admitted just under the threshold
+  ## still runs to completion. So the threshold nets one worst-case decision
+  ## off 60% -- 2.1 s spacing floor + two 20 s LLM attempts + the turn delay
+  ## and the settle write, ~45 s -- and the hard stop is 0.56 (672 s of
+  ## 1200 s), which settles by 720 s = 60%. The soft stop sits a pair
+  ## boundary's worth of play below it at 0.55 (660 s).
+  PlayBudgetFraction* = 0.55
+  HardDeadlineFraction* = 0.56
+  ## The game container is NOT given COWORLD_TIMEOUT_SECONDS; assume this.
+  DefaultEpisodeTimeoutSeconds* = 1200.0
+  ## Inter-decision wall spacing floor (the Bedrock sidecar caps an episode at
+  ## 30 requests/minute).
+  DecisionSpacingMs* = 2100
 
 type
   PlayerAction* = object
@@ -34,32 +49,46 @@ type
     amount*: int   ## bet size / raise-to street total; ignored otherwise
 
   Sim* = object
-    ## One hand of hold'em.
+    ## One hand.
     config*: GameConfig
     hand*: int             ## 0-based hand index in the match
-    seats*: seq[Seat]
-    button*: int
+    pair*: int             ## duplicate pair index (hand div 2)
+    mirror*: bool          ## the mirror half of the pair
+    seats*: seq[Seat]      ## indexed by SLOT
+    order*: seq[int]       ## slot sitting at each table position
+    posOf*: seq[int]       ## table position of each slot
+    button*: int           ## slot at position 0
     sbSeat*: int
     bbSeat*: int
     board*: seq[int]
     street*: Street
+    round*: int            ## 0-based betting round
+    wagers*: int           ## wagers made this round (fixed-limit rungs)
     currentBet*: int       ## highest street commitment so far
     minRaiseSize*: int     ## smallest legal full-raise increment right now
     shortRaiseAccum: int   ## short all-in increments since the last full raise
     actingSeat*: int       ## seat to act; -1 once the hand is done
     pot*: int              ## chips committed this hand, all streets
     done*: bool
+    voided*: bool          ## abandoned by the hard deadline; not scored
     deck: seq[int]         ## server-side only; replays carry cards in events
     dealIndex: int
     events*: seq[GameEvent]
 
   Match* = object
-    ## A full episode: up to `config.hands` hands, stacks carried over.
+    ## A full episode.
     config*: GameConfig
     sim*: Sim              ## the hand in progress
     history: seq[GameEvent]
-    handsPlayed*: int
+    names*: seq[string]
+    handsPlayed*: int      ## hands dealt and finished, voided ones included
+    handsScored*: int      ## hands whose chips counted
+    net*: seq[int]         ## cumulative net chips by slot
+    handsWon*: seq[int]
+    stackOffs*: seq[int]
     done*: bool
+    ended*: bool           ## the tail (calib/audit/matchEnd) is recorded
+    reason*: EndReason
 
 const CogNames* = [
   "Sprocket", "Gizmo", "Ratchet", "Widget", "Bolt",
@@ -68,37 +97,80 @@ const CogNames* = [
 
 proc tableNames*(players: seq[PlayerConfig], seed: int): seq[string] =
   ## Policy display names never reach the table: every seat plays under an
-  ## anonymous cog name, drawn deterministically from the seed so replays
-  ## and the live table agree. A policy name at the table leaks strategy
-  ## ("that seat is the champion") straight into the LLMs' transcripts; the
-  ## viewers map seats back to policy names for spectators.
+  ## anonymous cog alias, drawn deterministically from the seed so replays and
+  ## the live table agree. The viewers map seats back to policy names for
+  ## spectators.
   var rng = initRand(int64(seed) * 6779 + 31)
   var pool = @CogNames
   rng.shuffle(pool)
   for index in 0 ..< players.len:
     if index < pool.len:
-      result.add(pool[index])
+      result.add(truncateRunes(pool[index], MaxAliasLen))
     else:
-      result.add("Cog " & $(index + 1))
+      result.add(truncateRunes("Cog " & $(index + 1), MaxAliasLen))
+
+proc expectedDecisionTenths*(config: GameConfig): int =
+  ## Expected decisions per hand, in tenths, per the design's budget table.
+  case config.variant
+  of vKuhn: 26
+  of vLeduc: 54
+  of vHoldem: (if config.players.len <= 2: 60 else: 130)
+
+proc handCap*(config: GameConfig): int =
+  (EpisodeDecisionBudget * 10) div config.expectedDecisionTenths()
 
 proc sampleEpisode*(config: GameConfig): GameConfig =
-  ## Fits the configured hand count into one episode's call budget: every
-  ## player action is one model call, so the affordable hand count depends
-  ## on the seat count. Idempotent: a config that already carries the cap
-  ## (a replay being re-read) is returned untouched.
+  ## Fits the configured hand count into the episode's decision budget and
+  ## rounds DOWN to an even number so every duplicate pair is complete.
+  ## Idempotent: a config that already carries the cap (a replay being
+  ## re-read) is returned untouched.
   result = config
   if result.sampled:
     return
-  let seats = max(config.players.len, 2)
-  ## Roughly: everyone acts once preflop and the shorthanded field acts a
-  ## few more times across the later streets.
-  let callsPerHand = max(2 * seats + 2, 6)
-  result.hands = max(
-    min(config.hands, EpisodeCallBudget div callsPerHand), MinHands)
-  let plannedActions = max(result.hands * callsPerHand, 1)
-  result.turnDelayMs =
-    min(config.turnDelayMs, PacingBudgetMs div plannedActions)
+  var hands = min(config.hands, config.handCap())
+  if config.duplicate:
+    hands = hands - (hands mod 2)
+  result.hands = max(hands, MinHands)
   result.sampled = true
+
+proc seatOrderFor*(config: GameConfig): seq[int] =
+  ## Seed-derived permutation: `result[p]` is the slot sitting at table
+  ## position `p`. A colluding pair cannot count on a fixed relative position.
+  let n = config.players.len
+  result = newSeq[int](n)
+  for index in 0 ..< n:
+    result[index] = index
+  if config.randomiseSeating:
+    var rng = initRand(int64(config.seed) * 7907 + 101)
+    rng.shuffle(result)
+
+proc positionsFor*(config: GameConfig, hand: int): seq[int] =
+  ## The position map for a hand. The mirror half of a duplicate pair rotates
+  ## the whole table by half a table, so each seat plays its counterpart's
+  ## cards from its counterpart's position.
+  let n = config.players.len
+  let order =
+    if config.seatOrder.len == n: config.seatOrder
+    else: config.seatOrderFor()
+  let mirror = config.duplicate and (hand mod 2 == 1)
+  result = newSeq[int](n)
+  for position in 0 ..< n:
+    result[position] =
+      if mirror: order[(position + n div 2) mod n]
+      else: order[position]
+
+proc pairDeck*(config: GameConfig, pair: int): seq[int] =
+  ## Both hands of a pair are dealt from this one shuffle.
+  var rng = initRand(int64(config.seed) * 104729 + int64(pair) * 7919 + 13)
+  case config.variant
+  of vKuhn:
+    result = kuhnDeck()
+    rng.shuffle(result)
+  of vLeduc:
+    result = leducDeck()
+    rng.shuffle(result)
+  of vHoldem:
+    result = shuffledDeck(rng)
 
 # ---- Seat and turn helpers --------------------------------------------------
 
@@ -106,7 +178,6 @@ proc inHand*(seat: Seat): bool =
   not seat.isOut and not seat.folded
 
 proc liveCount*(sim: Sim): int =
-  ## Seats still contesting the pot.
   for seat in sim.seats:
     if seat.inHand:
       inc result
@@ -115,14 +186,14 @@ proc needsAction(sim: Sim, index: int): bool =
   let seat = sim.seats[index]
   if not seat.inHand or seat.allIn:
     return false
-  ## Chips owed always demand a response, even from the last seat with a
-  ## live stack (fold or call the shove).
+  ## Chips owed always demand a response, even from the last seat with a live
+  ## stack (fold or call the shove).
   if seat.committed < sim.currentBet:
     return true
   if seat.acted:
     return false
-  ## A voluntary check or bet needs a live opponent who could respond;
-  ## once everyone else is all-in the betting is simply over.
+  ## A voluntary check or bet needs a live opponent who could respond; once
+  ## everyone else is all-in the betting is simply over.
   for other in 0 ..< sim.seats.len:
     if other != index and sim.seats[other].inHand and
         not sim.seats[other].allIn:
@@ -130,41 +201,67 @@ proc needsAction(sim: Sim, index: int): bool =
   false
 
 proc nextNeeding(sim: Sim, fromSeat: int): int =
-  ## First seat clockwise strictly after `fromSeat` that still owes an
-  ## action this street; -1 when the street is settled.
+  ## First seat clockwise (in TABLE POSITION order) strictly after `fromSeat`
+  ## that still owes an action this street; -1 when the street is settled.
   let n = sim.seats.len
+  let from0 = sim.posOf[fromSeat]
   for offset in 1 .. n:
-    let index = (fromSeat + offset) mod n
+    let index = sim.order[(from0 + offset) mod n]
     if sim.needsAction(index):
       return index
   -1
 
-proc nextIn(sim: Sim, fromSeat: int): int =
+proc nextIn*(sim: Sim, fromSeat: int): int =
   ## First seat clockwise strictly after `fromSeat` still in the hand.
   let n = sim.seats.len
+  let from0 = sim.posOf[fromSeat]
   for offset in 1 .. n:
-    let index = (fromSeat + offset) mod n
+    let index = sim.order[(from0 + offset) mod n]
     if sim.seats[index].inHand:
       return index
   -1
 
+proc wagerSize*(sim: Sim): int =
+  sim.config.variant.betSizes(sim.config.bigBlind)[min(sim.round, 1)]
+
 proc callAmount*(sim: Sim, seat: int): int =
-  ## Chips this seat must add to match the current bet (stack-capped).
   min(max(sim.currentBet - sim.seats[seat].committed, 0),
     sim.seats[seat].stack)
 
 proc maxRaiseTo*(sim: Sim, seat: int): int =
   sim.seats[seat].committed + sim.seats[seat].stack
 
+proc minBet*(sim: Sim, seat: int): int =
+  if sim.config.variant.fixedLimit:
+    min(sim.wagerSize(), sim.seats[seat].stack)
+  else:
+    min(max(sim.config.bigBlind, 1), sim.seats[seat].stack)
+
 proc minRaiseTo*(sim: Sim, seat: int): int =
   ## Smallest legal raise-to total for this seat (its all-in if short).
-  min(sim.currentBet + sim.minRaiseSize, sim.maxRaiseTo(seat))
+  if sim.config.variant.fixedLimit:
+    min(sim.currentBet + sim.wagerSize(), sim.maxRaiseTo(seat))
+  else:
+    min(sim.currentBet + sim.minRaiseSize, sim.maxRaiseTo(seat))
 
-proc minBet*(sim: Sim, seat: int): int =
-  min(max(sim.config.bigBlind, 1), sim.seats[seat].stack)
+proc wagerCapReached*(sim: Sim): bool =
+  sim.config.variant.fixedLimit and
+    sim.wagers >= sim.config.variant.maxWagers()
 
 proc canRaise*(sim: Sim, seat: int): bool =
+  if sim.wagerCapReached():
+    return false
   sim.seats[seat].mayRaise and sim.maxRaiseTo(seat) > sim.currentBet
+
+proc canBet*(sim: Sim, seat: int): bool =
+  sim.currentBet == 0 and not sim.wagerCapReached() and
+    sim.maxRaiseTo(seat) > 0
+
+proc oddChipFirst*(sim: Sim): int =
+  ## Where an odd chip goes: position 0 (the button) on the calibration rungs,
+  ## clockwise from the button's left at Hold'em.
+  if sim.config.variant.fixedLimit: sim.order[0]
+  else: sim.order[1 mod sim.seats.len]
 
 # ---- Events -----------------------------------------------------------------
 
@@ -180,7 +277,10 @@ proc addEvent(
   stackAfter = -1,
   betAfter = -1,
   potAfter = -1,
-  text = ""
+  pair = -1,
+  mirror = false,
+  text = "",
+  data: JsonNode = nil
 ) =
   sim.events.add(GameEvent(
     kind: kind,
@@ -195,20 +295,23 @@ proc addEvent(
     stackAfter: stackAfter,
     betAfter: betAfter,
     potAfter: potAfter,
-    text: text
+    pair: pair,
+    mirror: mirror,
+    text: text,
+    data: data
   ))
 
 # ---- Chip movement ----------------------------------------------------------
 
 proc commit(sim: var Sim, index: int, chips: int): int =
-  ## Moves up to `chips` from the seat's stack into the pot; returns the
-  ## amount actually moved (the stack caps it — that is an all-in).
+  ## Moves up to `chips` from the seat's stack into the pot; returns the amount
+  ## actually moved (the stack caps it — that is an all-in).
   result = min(chips, sim.seats[index].stack)
   sim.seats[index].stack -= result
   sim.seats[index].committed += result
   sim.seats[index].totalCommitted += result
   sim.pot += result
-  if sim.seats[index].stack == 0 and not sim.seats[index].isOut:
+  if sim.seats[index].stack == 0:
     sim.seats[index].allIn = true
 
 proc reopen(sim: var Sim, raiser: int) =
@@ -230,8 +333,11 @@ proc dealNextStreet(sim: var Sim) =
   sim.currentBet = 0
   sim.minRaiseSize = sim.config.bigBlind
   sim.shortRaiseAccum = 0
+  sim.wagers = 0
+  inc sim.round
   sim.street = succ(sim.street)
-  let count = if sim.street == stFlop: 3 else: 1
+  let count =
+    if sim.config.variant == vHoldem and sim.street == stFlop: 3 else: 1
   var dealt: seq[int]
   for _ in 1 .. count:
     dealt.add(sim.deck[sim.dealIndex])
@@ -240,10 +346,9 @@ proc dealNextStreet(sim: var Sim) =
   sim.addEvent(evBoard, -1, cards = dealt, potAfter = sim.pot)
 
 proc refundUncalled(sim: var Sim) =
-  ## The chips nobody matched go back where they came from: the seat with
-  ## the deepest commitment takes back everything above the second-deepest.
-  ## Only a live seat can hold an uncalled bet — a folder forfeits its
-  ## chips to the pot whatever it committed.
+  ## The chips nobody matched go back where they came from: the seat with the
+  ## deepest commitment takes back everything above the second-deepest. Only a
+  ## live seat can hold an uncalled bet.
   var hiSeat = -1
   var hi = -1
   var second = -1
@@ -266,9 +371,41 @@ proc refundUncalled(sim: var Sim) =
     stackAfter = sim.seats[hiSeat].stack, potAfter = sim.pot,
     text = "returned")
 
+proc showdownRank*(sim: Sim, seat: int): int =
+  ## Comparable hand strength for this variant.
+  let hole = sim.seats[seat].holeCards
+  case sim.config.variant
+  of vKuhn:
+    1000 + hole[0].rank
+  of vLeduc:
+    leducRank(hole[0], if sim.board.len > 0: sim.board[0] else: -1)
+  of vHoldem:
+    evalBest(hole & sim.board)
+
+proc describeShowdown*(variant: Variant, packed: int, hole: seq[int],
+    board: seq[int]): string =
+  case variant
+  of vKuhn, vLeduc:
+    const Names = ["deuce", "three", "four", "five", "six", "seven", "eight",
+      "nine", "ten", "jack", "queen", "king", "ace"]
+    const Plural = ["deuces", "threes", "fours", "fives", "sixes", "sevens",
+      "eights", "nines", "tens", "jacks", "queens", "kings", "aces"]
+    let value = hole[0].rank
+    if packed >= 2000: "a pair of " & Plural[value]
+    else: Names[value] & " high"
+  of vHoldem:
+    describeRank(packed)
+
+proc showdownBest*(sim: Sim, seat: int): seq[int] =
+  let hole = sim.seats[seat].holeCards
+  case sim.config.variant
+  of vKuhn: hole
+  of vLeduc: hole & sim.board
+  of vHoldem: bestFive(hole & sim.board).five
+
 proc resolveHand(sim: var Sim) =
-  ## Refunds the uncalled excess, shows the called hands down, pays every
-  ## pot (side pots from commitment levels), marks busts, ends the hand.
+  ## Refunds the uncalled excess, shows the called hands down, pays every pot
+  ## (side pots from commitment levels), records stack-offs, ends the hand.
   sim.actingSeat = -1
   sim.refundUncalled()
 
@@ -276,15 +413,15 @@ proc resolveHand(sim: var Sim) =
   var won = newSeq[bool](sim.seats.len)
 
   proc payout(sim: var Sim, winners: seq[int], slice: int, label: string) =
-    ## Split evenly; odd chips go to the first winners clockwise from the
-    ## button's left, one each.
+    ## Split evenly; odd chips go to the first winners from `oddChipFirst`.
     let share = slice div winners.len
     var odd = slice mod winners.len
     var ordered: seq[int]
-    var probe = (sim.button + 1) mod sim.seats.len
+    var probe = sim.posOf[sim.oddChipFirst()]
     for _ in 0 ..< sim.seats.len:
-      if probe in winners:
-        ordered.add(probe)
+      let slot = sim.order[probe]
+      if slot in winners:
+        ordered.add(slot)
       probe = (probe + 1) mod sim.seats.len
     for index in ordered:
       var chips = share
@@ -301,8 +438,7 @@ proc resolveHand(sim: var Sim) =
         text = label)
 
   if not contested:
-    ## Everyone else folded: the last cog standing takes the whole pot,
-    ## whatever anyone committed — side pots only exist at showdown.
+    ## Everyone else folded: the last cog standing takes the whole pot.
     for index in 0 ..< sim.seats.len:
       if sim.seats[index].inHand:
         if sim.pot > 0:
@@ -310,16 +446,21 @@ proc resolveHand(sim: var Sim) =
         break
   else:
     sim.street = stShowdown
-    ## Reveal in clockwise order from the button's left.
     var ranks = newSeq[int](sim.seats.len)
     var seat = sim.nextIn(sim.button)
-    for _ in 0 ..< sim.liveCount():
-      let hole = sim.seats[seat].holeCards
-      let (rank, five) = bestFive(hole & sim.board)
-      ranks[seat] = rank
+    if sim.seats[sim.button].inHand:
+      seat = sim.button
+    var revealed = 0
+    let live = sim.liveCount()
+    while revealed < live:
+      let packed = sim.showdownRank(seat)
+      ranks[seat] = packed
       sim.seats[seat].revealed = true
-      sim.addEvent(evReveal, seat, cards = hole, best = five,
-        text = describeRank(rank))
+      sim.addEvent(evReveal, seat, cards = sim.seats[seat].holeCards,
+        best = sim.showdownBest(seat),
+        text = describeShowdown(sim.config.variant, packed,
+          sim.seats[seat].holeCards, sim.board))
+      inc revealed
       seat = sim.nextIn(seat)
 
     ## The live seats' commitment levels slice the pot: everyone pays into
@@ -361,9 +502,8 @@ proc resolveHand(sim: var Sim) =
       sim.payout(winners, slice,
         if potIndex == 0: "main" else: "side " & $potIndex)
       inc potIndex
-    ## Chips are the score, so none may evaporate: dead money committed
-    ## beyond every live seat's level (a folder who outbet the table)
-    ## sweeps to the deepest pot's winners.
+    ## Chips are the score, so none may evaporate: dead money committed beyond
+    ## every live seat's level sweeps to the deepest pot's winners.
     if sim.pot > 0 and lastWinners.len > 0:
       sim.payout(lastWinners, sim.pot, "sweep")
 
@@ -371,19 +511,31 @@ proc resolveHand(sim: var Sim) =
     if won[index]:
       inc sim.seats[index].handsWon
 
-  ## Busts: a seat that ends the hand with nothing sits out from here on.
-  for index in 0 ..< sim.seats.len:
-    if not sim.seats[index].isOut and sim.seats[index].stack == 0:
-      sim.seats[index].isOut = true
-      sim.addEvent(evBust, index)
+  if sim.config.chipRace:
+    ## Busts are final: a seat that ends the hand with nothing sits out.
+    for index in 0 ..< sim.seats.len:
+      if not sim.seats[index].isOut and sim.seats[index].stack == 0:
+        sim.seats[index].isOut = true
+        sim.addEvent(evBust, index)
+  elif sim.config.variant == vHoldem:
+    ## Cosmetic only: stacks reset next hand, nobody is ever removed.
+    for index in 0 ..< sim.seats.len:
+      if sim.seats[index].stack == 0:
+        sim.addEvent(evStackOff, index)
 
-  sim.addEvent(evHandEnd, -1, potAfter = 0)
+  var netNode = newJArray()
+  for index, seat in sim.seats:
+    ## On the chip race `seat.net` is the carried stack minus the buy-in, so
+    ## the hand's own swing is already inside `seat.stack`.
+    netNode.add(%(
+      if sim.config.chipRace: seat.stack - sim.config.startingStack
+      else: seat.net + seat.stack - sim.config.startingStack))
+  sim.addEvent(evHandEnd, -1, potAfter = 0, data = %*{"net": netNode})
   sim.done = true
 
 proc progress(sim: var Sim, fromSeat: int) =
-  ## After an action (or the blinds), picks the next actor — or closes the
-  ## street, deals the next one (which runs the board out by itself when
-  ## everyone is all-in), and resolves the hand.
+  ## After an action (or the blinds/antes), picks the next actor — or closes
+  ## the street, deals the next one, and resolves the hand.
   var origin = fromSeat
   while not sim.done:
     if sim.liveCount() <= 1:
@@ -393,102 +545,172 @@ proc progress(sim: var Sim, fromSeat: int) =
     if next >= 0:
       sim.actingSeat = next
       return
-    if sim.street == stRiver:
+    if sim.street == sim.config.variant.lastStreet():
       sim.resolveHand()
       return
     sim.dealNextStreet()
-    origin = sim.button
+    ## OpenSpiel's Kuhn/Leduc do not switch the first actor between rounds:
+    ## position 0 acts first every round. Hold'em opens left of the button.
+    origin =
+      if sim.config.variant.fixedLimit: sim.order[sim.seats.len - 1]
+      else: sim.button
 
 # ---- Hand setup -------------------------------------------------------------
 
 proc initHand*(
   config: GameConfig,
   hand: int,
-  button: int,
-  stacks: seq[int],
-  handsWon: seq[int],
   names: seq[string],
-  deck: seq[int] = @[]
+  handsWon: seq[int],
+  net: seq[int],
+  deck: seq[int] = @[],
+  stacks: seq[int] = @[],
+  button = -1
 ): Sim =
-  ## Deals one hand: blinds up, hole cards out, preflop action ready.
-  ## `stacks` carries the chip counts into the hand; a zero stack sits out.
-  ## A non-empty `deck` overrides the seeded shuffle (tests and fixtures):
-  ## hole cards go out two at a time clockwise from the small blind, then
-  ## the flop, turn, and river in order.
-  if config.players.len < 2 or config.players.len > MaxSeats:
-    raise newException(CosinoError,
-      "cosino needs 2.." & $MaxSeats & " players")
-  result = Sim(config: config, hand: hand, button: button,
-    street: stPreflop, actingSeat: -1)
-  var active = 0
-  for index in 0 ..< config.players.len:
-    result.seats.add(Seat(
-      name: names[index],
-      stack: stacks[index],
-      isOut: stacks[index] <= 0,
-      handsWon: handsWon[index],
-      mayRaise: stacks[index] > 0
-    ))
-    if stacks[index] > 0:
-      inc active
-  if active < 2:
-    raise newException(CosinoError, "a hand needs two funded seats")
-  if result.seats[button].isOut:
-    raise newException(CosinoError, "the button must be a funded seat")
-
-  ## The deck draws from the seed and hand index, so a pinned seed
-  ## reproduces the whole episode.
-  if deck.len > 0:
-    result.deck = deck
+  ## Deals one hand. On the ladder EVERY seat starts on `startingStack` —
+  ## there are no busts and no carried chips. On the chip race the caller
+  ## passes `stacks` (a zero stack sits out) and the `button` slot, and the
+  ## table ring is the seat order rotated so the button holds position 0.
+  ## A non-empty `deck` overrides the pair shuffle.
+  let n = config.players.len
+  if n < 2 or n > MaxSeats:
+    raise newException(CosinoError, "cosino needs 2.." & $MaxSeats & " players")
+  result = Sim(config: config, hand: hand, street: stPreflop, actingSeat: -1)
+  result.pair = if config.duplicate: hand div 2 else: hand
+  result.mirror = config.duplicate and (hand mod 2 == 1)
+  if config.chipRace:
+    if stacks.len != n:
+      raise newException(CosinoError, "the chip race needs a stack per seat")
+    let ring =
+      if config.seatOrder.len == n: config.seatOrder
+      else: config.seatOrderFor()
+    var at = -1
+    for position, slot in ring:
+      if slot == button:
+        at = position
+    if at < 0:
+      raise newException(CosinoError, "the button must be a seated slot")
+    if stacks[button] <= 0:
+      raise newException(CosinoError, "the button must be a funded seat")
+    result.order = newSeq[int](n)
+    for position in 0 ..< n:
+      result.order[position] = ring[(at + position) mod n]
   else:
-    var rng = initRand(int64(config.seed) * 104729 + int64(hand) * 7919 + 13)
-    result.deck = shuffledDeck(rng)
-
-  result.addEvent(evHandStart, button,
-    amount = config.bigBlind, potAfter = 0,
-    text = $config.smallBlind & "/" & $config.bigBlind)
-
-  ## Heads-up, the button posts the small blind and acts first preflop;
-  ## multiway, the blinds sit clockwise from the button.
-  if active == 2:
-    result.sbSeat = button
-    result.bbSeat = result.nextIn(button)
+    result.order = positionsFor(config, hand)
+  result.posOf = newSeq[int](n)
+  for position, slot in result.order:
+    result.posOf[slot] = position
+  result.button = result.order[0]
+  var active = n
+  if config.chipRace:
+    active = 0
+    for index in 0 ..< n:
+      result.seats.add(Seat(
+        name: names[index],
+        stack: stacks[index],
+        isOut: stacks[index] <= 0,
+        handsWon: handsWon[index],
+        net: stacks[index] - config.startingStack,
+        mayRaise: stacks[index] > 0
+      ))
+      if stacks[index] > 0:
+        inc active
+    if active < 2:
+      raise newException(CosinoError, "a hand needs two funded seats")
   else:
-    result.sbSeat = result.nextIn(button)
-    result.bbSeat = result.nextIn(result.sbSeat)
+    for index in 0 ..< n:
+      result.seats.add(Seat(
+        name: names[index],
+        stack: config.startingStack,
+        handsWon: handsWon[index],
+        net: net[index],
+        mayRaise: true
+      ))
 
-  ## Hole cards, clockwise from the small blind.
-  var seat = result.sbSeat
-  for _ in 0 ..< active:
-    var hole = @[result.deck[result.dealIndex],
-      result.deck[result.dealIndex + 1]]
-    result.dealIndex += 2
-    result.seats[seat].holeCards = hole
-    result.addEvent(evDeal, seat, cards = hole)
-    seat = result.nextIn(seat)
+  result.deck =
+    if deck.len > 0: deck else: pairDeck(config, result.pair)
 
-  for (blindSeat, blind, label) in [
-    (result.sbSeat, config.smallBlind, "small"),
-    (result.bbSeat, config.bigBlind, "big")
-  ]:
-    let posted = result.commit(blindSeat, blind)
-    result.addEvent(evBlind, blindSeat, amount = posted,
-      allIn = result.seats[blindSeat].allIn,
-      stackAfter = result.seats[blindSeat].stack,
-      betAfter = result.seats[blindSeat].committed,
-      potAfter = result.pot, text = label)
+  var positionsNode = newJArray()
+  for slot in result.order:
+    positionsNode.add(%slot)
+  result.addEvent(evHandStart, result.button,
+    amount = (if config.variant == vHoldem: config.bigBlind else: config.ante),
+    potAfter = 0, pair = result.pair, mirror = result.mirror,
+    text = (
+      if config.variant == vHoldem:
+        $config.smallBlind & "/" & $config.bigBlind
+      else:
+        "ante " & $config.ante
+    ),
+    data = %*{"positions": positionsNode})
 
-  ## The big blind is the bet to beat even when its poster was short.
-  result.currentBet = config.bigBlind
-  result.minRaiseSize = config.bigBlind
-  result.progress(result.bbSeat)
+  case config.variant
+  of vKuhn, vLeduc:
+    ## One private card each, dealt to position 0 then position 1.
+    for position in 0 ..< n:
+      let slot = result.order[position]
+      let hole = @[result.deck[result.dealIndex]]
+      inc result.dealIndex
+      result.seats[slot].holeCards = hole
+      result.addEvent(evDeal, slot, cards = hole)
+    for position in 0 ..< n:
+      let slot = result.order[position]
+      let posted = result.commit(slot, config.ante)
+      result.addEvent(evAnte, slot, amount = posted,
+        allIn = result.seats[slot].allIn,
+        stackAfter = result.seats[slot].stack,
+        betAfter = result.seats[slot].committed,
+        potAfter = result.pot, text = "ante")
+    ## Antes are dead money: nobody owes anything to open the round.
+    for index in 0 ..< n:
+      result.seats[index].committed = 0
+    result.currentBet = 0
+    result.minRaiseSize = result.wagerSize()
+    result.progress(result.order[n - 1])
+  of vHoldem:
+    ## Heads-up, the button posts the small blind and acts first preflop;
+    ## multiway, the blinds sit clockwise from the button. On the chip race
+    ## "heads-up" means two FUNDED seats, and busted seats are skipped.
+    if active == 2:
+      result.sbSeat = result.button
+      result.bbSeat = result.nextIn(result.button)
+    elif config.chipRace:
+      result.sbSeat = result.nextIn(result.button)
+      result.bbSeat = result.nextIn(result.sbSeat)
+    else:
+      result.sbSeat = result.order[1]
+      result.bbSeat = result.order[2]
+
+    var seat = result.sbSeat
+    for _ in 0 ..< active:
+      let hole = @[result.deck[result.dealIndex],
+        result.deck[result.dealIndex + 1]]
+      result.dealIndex += 2
+      result.seats[seat].holeCards = hole
+      result.addEvent(evDeal, seat, cards = hole)
+      seat = result.nextIn(seat)
+
+    for (blindSeat, blind, label) in [
+      (result.sbSeat, config.smallBlind, "small"),
+      (result.bbSeat, config.bigBlind, "big")
+    ]:
+      let posted = result.commit(blindSeat, blind)
+      result.addEvent(evBlind, blindSeat, amount = posted,
+        allIn = result.seats[blindSeat].allIn,
+        stackAfter = result.seats[blindSeat].stack,
+        betAfter = result.seats[blindSeat].committed,
+        potAfter = result.pot, text = label)
+
+    result.currentBet = config.bigBlind
+    result.minRaiseSize = config.bigBlind
+    result.progress(result.bbSeat)
 
 # ---- Player actions ---------------------------------------------------------
 
 proc recordSay*(sim: var Sim, seat: int, text: string) =
   if text.len == 0:
     return
-  sim.addEvent(evSay, seat, text = text)
+  sim.addEvent(evSay, seat, text = truncateRunes(text, MaxSayLen))
 
 proc applyAction*(sim: var Sim, seat: int, act: PlayerAction) =
   ## One player action. Raises CosinoError on anything illegal; the caller
@@ -497,6 +719,7 @@ proc applyAction*(sim: var Sim, seat: int, act: PlayerAction) =
     raise newException(CosinoError, "the hand is over")
   if seat != sim.actingSeat:
     raise newException(CosinoError, "not this seat's turn")
+  let limited = sim.config.variant.fixedLimit
 
   case act.kind
   of akFold:
@@ -522,17 +745,23 @@ proc applyAction*(sim: var Sim, seat: int, act: PlayerAction) =
   of akBet:
     if sim.currentBet > 0:
       raise newException(CosinoError, "facing a bet — raise instead")
-    let target = act.amount
+    if sim.wagerCapReached():
+      raise newException(CosinoError, "the wager cap for this round is reached")
+    var target = act.amount
     let ceiling = sim.maxRaiseTo(seat)
+    if limited:
+      ## The wager size is fixed by the variant; `amount` is ignored.
+      target = min(sim.wagerSize(), ceiling)
     if target <= 0 or target > ceiling:
       raise newException(CosinoError, "bet must be between 1 and the stack")
-    if target < sim.minBet(sim.actingSeat) and target < ceiling:
+    if not limited and target < sim.minBet(seat) and target < ceiling:
       raise newException(CosinoError,
         "bet below the minimum (" & $sim.minBet(seat) & ")")
     discard sim.commit(seat, target - sim.seats[seat].committed)
     sim.currentBet = target
     sim.minRaiseSize = target
     sim.shortRaiseAccum = 0
+    inc sim.wagers
     sim.reopen(seat)
     sim.addEvent(evAction, seat, action = akBet, amount = target,
       allIn = sim.seats[seat].allIn,
@@ -541,23 +770,30 @@ proc applyAction*(sim: var Sim, seat: int, act: PlayerAction) =
   of akRaise:
     if sim.currentBet == 0:
       raise newException(CosinoError, "nothing to raise — bet instead")
+    if sim.wagerCapReached():
+      raise newException(CosinoError, "the wager cap for this round is reached")
     if not sim.seats[seat].mayRaise:
       raise newException(CosinoError,
         "betting is closed to this seat this street")
     let ceiling = sim.maxRaiseTo(seat)
-    if act.amount <= sim.currentBet:
+    var target = act.amount
+    if limited:
+      target = min(sim.currentBet + sim.wagerSize(), ceiling)
+    if target <= sim.currentBet:
       raise newException(CosinoError, "a raise must exceed the current bet")
-    if act.amount > ceiling:
+    if target > ceiling:
       raise newException(CosinoError, "cannot raise beyond the stack")
-    let increment = act.amount - sim.currentBet
-    let full = increment >= sim.minRaiseSize
-    if act.amount < ceiling and not full:
+    let increment = target - sim.currentBet
+    let full = limited or increment >= sim.minRaiseSize
+    if not limited and target < ceiling and not full:
       raise newException(CosinoError,
         "raise below the minimum (to " & $sim.minRaiseTo(seat) & ")")
-    discard sim.commit(seat, act.amount - sim.seats[seat].committed)
-    sim.currentBet = act.amount
+    discard sim.commit(seat, target - sim.seats[seat].committed)
+    sim.currentBet = target
+    inc sim.wagers
     if full:
-      sim.minRaiseSize = increment
+      if not limited:
+        sim.minRaiseSize = increment
       sim.shortRaiseAccum = 0
       sim.reopen(seat)
     else:
@@ -567,7 +803,7 @@ proc applyAction*(sim: var Sim, seat: int, act: PlayerAction) =
       if sim.shortRaiseAccum >= sim.minRaiseSize:
         sim.shortRaiseAccum = 0
         sim.reopen(seat)
-    sim.addEvent(evAction, seat, action = akRaise, amount = act.amount,
+    sim.addEvent(evAction, seat, action = akRaise, amount = target,
       allIn = sim.seats[seat].allIn,
       stackAfter = sim.seats[seat].stack,
       betAfter = sim.seats[seat].committed, potAfter = sim.pot)
@@ -576,278 +812,25 @@ proc applyAction*(sim: var Sim, seat: int, act: PlayerAction) =
   sim.seats[seat].mayRaise = false
   sim.progress(seat)
 
-# ---- Match ------------------------------------------------------------------
-
-proc totalChips*(config: GameConfig): int =
-  config.players.len * config.startingStack
-
-proc initMatch*(config: GameConfig): Match =
-  if config.players.len < 2 or config.players.len > MaxSeats:
-    raise newException(CosinoError,
-      "cosino needs 2.." & $MaxSeats & " players")
-  let names = tableNames(config.players, config.seed)
-  var stacks = newSeq[int](config.players.len)
-  var handsWon = newSeq[int](config.players.len)
-  for index in 0 ..< stacks.len:
-    stacks[index] = config.startingStack
-  let button = ((config.seed mod config.players.len) +
-    config.players.len) mod config.players.len
-  Match(
-    config: config,
-    sim: initHand(config, 0, button, stacks, handsWon, names)
-  )
-
-proc allEvents*(match: Match): seq[GameEvent] =
-  match.history & match.sim.events
-
-proc stacks*(match: Match): seq[int] =
-  for seat in match.sim.seats:
-    result.add(seat.stack)
-
-proc fundedSeats(match: Match): int =
-  for seat in match.sim.seats:
-    if seat.stack > 0:
-      inc result
-
-proc finishHand*(match: var Match) =
-  ## Accounts the finished hand and ends the match at the hand limit or
-  ## when fewer than two seats can still post. Deliberately does NOT deal
-  ## the next hand — call `nextHand` for that — so the caller can stop the
-  ## match between hands (episode deadline) without a dealt-but-unplayed
-  ## hand corrupting the final stacks.
-  if not match.sim.done or match.done:
-    raise newException(CosinoError, "no finished hand to fold in")
-  inc match.handsPlayed
-  if match.handsPlayed >= match.config.hands or match.fundedSeats() < 2:
-    match.done = true
-
-proc nextHand*(match: var Match) =
-  ## Deals the next hand of a live match.
-  if match.done or not match.sim.done:
-    raise newException(CosinoError, "the match is over or a hand is live")
-  var stacks: seq[int]
-  var handsWon: seq[int]
-  var names: seq[string]
-  for seat in match.sim.seats:
-    stacks.add(seat.stack)
-    handsWon.add(seat.handsWon)
-    names.add(seat.name)
-  ## The button walks clockwise to the next funded seat.
-  var button = (match.sim.button + 1) mod stacks.len
-  while stacks[button] <= 0:
-    button = (button + 1) mod stacks.len
-  match.history.add(match.sim.events)
-  match.sim = initHand(match.config, match.sim.hand + 1, button, stacks,
-    handsWon, names)
-
-proc endMatchEarly*(match: var Match) =
-  ## Stop after the hand just scored. The hosted platform kills an episode
-  ## that outlives its timeout and keeps NOTHING — no results, no replay —
-  ## so a short honest match always beats a long one that never lands.
-  match.done = true
-
-proc matchWinners*(match: Match): seq[bool] =
-  result = newSeq[bool](match.sim.seats.len)
-  var best = -1
-  for seat in match.sim.seats:
-    if seat.stack > best:
-      best = seat.stack
-  for index, seat in match.sim.seats:
-    result[index] = seat.stack == best
-
-proc resultsJson*(match: Match): JsonNode =
-  let winFlags = match.matchWinners()
-  let chips = match.config.totalChips()
-  var names = newJArray()
-  var scoresNode = newJArray()
-  var winNode = newJArray()
-  var stacksNode = newJArray()
-  var handsWonNode = newJArray()
-  var bustedNode = newJArray()
-  for index, seat in match.sim.seats:
-    ## Results are platform-facing: the league attributes scores by POLICY
-    ## name, not by the anonymous alias the seat played under.
-    names.add(%match.config.players[index].name)
-    ## The chip share IS the score: in [0,1], summing to 1 across seats,
-    ## comparable between episodes whatever the seat count.
-    scoresNode.add(%(seat.stack / chips))
-    winNode.add(%(match.done and winFlags[index]))
-    stacksNode.add(%seat.stack)
-    handsWonNode.add(%seat.handsWon)
-    bustedNode.add(%seat.isOut)
-  %*{
-    "names": names,
-    "scores": scoresNode,
-    "win": winNode,
-    "stacks": stacksNode,
-    "handsWon": handsWonNode,
-    "busted": bustedNode,
-    "handsPlayed": match.handsPlayed,
-    "hands": match.config.hands,
-    "startingStack": match.config.startingStack,
-    "smallBlind": match.config.smallBlind,
-    "bigBlind": match.config.bigBlind
-  }
-
-# ---- Viewer state -----------------------------------------------------------
-
-proc seatStates*(sim: Sim): JsonNode =
-  ## The seat panel every viewer draws. Hole cards ride along in full; the
-  ## server redacts them per player socket, spectators keep everything.
-  result = newJArray()
-  for index, seat in sim.seats:
-    var cardsNode = newJArray()
-    for card in seat.holeCards:
-      cardsNode.add(%card)
-    result.add(%*{
-      "name": seat.name,
-      "stack": seat.stack,
-      "bet": seat.committed,
-      "cards": cardsNode,
-      "revealed": seat.revealed,
-      "folded": seat.folded,
-      "allIn": seat.allIn,
-      "out": seat.isOut,
-      "acting": index == sim.actingSeat,
-      "handsWon": seat.handsWon
-    })
-
-proc tableStateJson*(sim: Sim): JsonNode =
-  var boardNode = newJArray()
-  for card in sim.board:
-    boardNode.add(%card)
-  %*{
-    "seats": sim.seatStates(),
-    "board": boardNode,
-    "pot": sim.pot,
-    "street": $sim.street,
-    "hand": sim.hand,
-    "button": sim.button,
-    "currentBet": sim.currentBet,
-    "handDone": sim.done
-  }
-
-# ---- Replay -----------------------------------------------------------------
-
-type
-  ReplayFrame* = object
-    ## One scrub position: the reconstructed table state after an event
-    ## prefix (frames[i] = state after events[0..<i]).
-    seats*: seq[Seat]
-    board*: seq[int]
-    pot*: int
-    street*: Street
-    hand*: int
-    button*: int
-    acting*: int      ## seat about to act (the next event's actor), or -1
-    handDone*: bool
-
-proc replayMatch*(config: GameConfig, events: seq[GameEvent]): seq[ReplayFrame] =
-  ## Re-derives the state timeline from a recorded event log. Events carry
-  ## amounts and stacks-after, so this never re-runs the betting engine.
-  let n = config.players.len
-  var frame = ReplayFrame(
-    street: stPreflop,
-    acting: -1,
-    button: -1
-  )
-  for index in 0 ..< n:
-    frame.seats.add(Seat(
-      name: "Seat " & $(index + 1),
-      stack: config.startingStack
-    ))
-  result.add(frame)
-  for at, event in events:
-    case event.kind
-    of evHandStart:
-      frame.hand = event.hand
-      frame.button = event.seat
-      frame.board = @[]
-      frame.pot = 0
-      frame.street = stPreflop
-      frame.handDone = false
-      for index in 0 ..< n:
-        frame.seats[index].committed = 0
-        frame.seats[index].totalCommitted = 0
-        frame.seats[index].folded = false
-        frame.seats[index].allIn = false
-        frame.seats[index].holeCards = @[]
-        frame.seats[index].revealed = false
-    of evDeal:
-      frame.seats[event.seat].holeCards = event.cards
-    of evBlind, evAction:
-      if event.kind == evAction and event.action == akFold:
-        frame.seats[event.seat].folded = true
-      ## `amount` is the raise-to total for bets and raises, so the chips
-      ## actually moved are the change in the street commitment.
-      frame.seats[event.seat].totalCommitted +=
-        max(event.betAfter - frame.seats[event.seat].committed, 0)
-      frame.seats[event.seat].stack = event.stackAfter
-      frame.seats[event.seat].committed = event.betAfter
-      frame.seats[event.seat].allIn = event.allIn
-      frame.pot = event.potAfter
-      frame.street = event.street
-    of evSay:
-      discard
-    of evBoard:
-      frame.board.add(event.cards)
-      frame.street = event.street
-      for index in 0 ..< n:
-        frame.seats[index].committed = 0
-    of evReveal:
-      frame.seats[event.seat].holeCards = event.cards
-      frame.seats[event.seat].revealed = true
-      frame.street = event.street
-    of evAward:
-      frame.seats[event.seat].stack = event.stackAfter
-      frame.pot = event.potAfter
-      if event.text != "returned":
-        frame.street = event.street
-    of evBust:
-      frame.seats[event.seat].isOut = true
-    of evHandEnd:
-      frame.pot = 0
-      frame.handDone = true
-    ## Who is about to act: the actor of the next action event, if the very
-    ## next event is one.
-    frame.acting =
-      if at + 1 < events.len and events[at + 1].kind == evAction:
-        events[at + 1].seat
-      else:
-        -1
-    result.add(frame)
-
-proc frameStateJson*(frame: ReplayFrame): JsonNode =
-  ## Same shape as tableStateJson, derived from a replay frame.
-  var seatsNode = newJArray()
-  for index, seat in frame.seats:
-    var cardsNode = newJArray()
-    for card in seat.holeCards:
-      cardsNode.add(%card)
-    seatsNode.add(%*{
-      "name": seat.name,
-      "stack": seat.stack,
-      "bet": seat.committed,
-      "cards": cardsNode,
-      "revealed": seat.revealed,
-      "folded": seat.folded,
-      "allIn": seat.allIn,
-      "out": seat.isOut,
-      "acting": index == frame.acting,
-      "handsWon": seat.handsWon
-    })
-  var boardNode = newJArray()
-  for card in frame.board:
-    boardNode.add(%card)
-  %*{
-    "seats": seatsNode,
-    "board": boardNode,
-    "pot": frame.pot,
-    "street": $frame.street,
-    "hand": frame.hand,
-    "button": frame.button,
-    "handDone": frame.handDone
-  }
+proc voidHand*(sim: var Sim) =
+  ## The hard deadline abandoned a live hand: every chip committed to it goes
+  ## back, so the sum of nets stays exactly zero and the hand is not scored.
+  if sim.done:
+    raise newException(CosinoError, "the hand is already over")
+  var refunds = newJArray()
+  for index in 0 ..< sim.seats.len:
+    let back = sim.seats[index].totalCommitted
+    sim.seats[index].stack += back
+    sim.seats[index].totalCommitted = 0
+    sim.seats[index].committed = 0
+    sim.seats[index].allIn = false
+    sim.pot -= back
+    refunds.add(%back)
+  sim.pot = 0
+  sim.actingSeat = -1
+  sim.addEvent(evHandVoid, -1, potAfter = 0, data = %*{"refunds": refunds})
+  sim.done = true
+  sim.voided = true
 
 # ---- Event JSON -------------------------------------------------------------
 
@@ -880,8 +863,14 @@ proc eventToJson*(event: GameEvent): JsonNode =
     result["betAfter"] = %event.betAfter
   if event.potAfter >= 0:
     result["potAfter"] = %event.potAfter
+  if event.pair >= 0:
+    result["pair"] = %event.pair
+  if event.mirror:
+    result["mirror"] = %true
   if event.text.len > 0:
     result["text"] = %event.text
+  if not event.data.isNil:
+    result["data"] = event.data
 
 proc eventFromJson*(node: JsonNode): GameEvent =
   result = GameEvent(
@@ -894,6 +883,8 @@ proc eventFromJson*(node: JsonNode): GameEvent =
     stackAfter: node{"stackAfter"}.getInt(-1),
     betAfter: node{"betAfter"}.getInt(-1),
     potAfter: node{"potAfter"}.getInt(-1),
+    pair: node{"pair"}.getInt(-1),
+    mirror: node{"mirror"}.getBool(false),
     text: node{"text"}.getStr("")
   )
   if node.hasKey("cards"):
@@ -904,3 +895,659 @@ proc eventFromJson*(node: JsonNode): GameEvent =
       result.best.add(card.getInt())
   if node.hasKey("action"):
     result.action = parseEnum[ActionKind](node["action"].getStr())
+  if node.hasKey("data"):
+    result.data = node["data"]
+
+# ---- Calibration and audit, both pure functions of the event log ------------
+
+proc calibFromEvents*(config: GameConfig, events: seq[GameEvent]):
+    seq[CalibResult] =
+  ## Exact exploitability per SLOT for the calibration rungs; an empty seq for
+  ## Hold'em, where no exact best response exists.
+  if not config.variant.fixedLimit:
+    return @[]
+  let calibVariant = if config.variant == vKuhn: cvKuhn else: cvLeduc
+  let n = config.players.len
+  var observed = newSeq[Table[string, seq[int]]](n)
+  for index in 0 ..< n:
+    observed[index] = initTable[string, seq[int]]()
+  var decisions = newSeq[int](n)
+
+  var positions = newSeq[int](n)     ## slot -> position
+  var cardOf = newSeq[int](n)
+  var boardRank = -1
+  var history = ""
+
+  for event in events:
+    case event.kind
+    of evHandStart:
+      history = ""
+      boardRank = -1
+      for index in 0 ..< n:
+        cardOf[index] = -1
+      if not event.data.isNil and event.data.hasKey("positions"):
+        for position, slot in event.data["positions"].getElems():
+          positions[slot.getInt()] = position
+    of evDeal:
+      if event.cards.len > 0:
+        cardOf[event.seat] = event.cards[0].rank
+    of evBoard:
+      if event.cards.len > 0:
+        boardRank = event.cards[0].rank
+      history.add("/")
+    of evAction:
+      let slot = event.seat
+      let position = positions[slot]
+      let key = infosetKey(position, cardOf[slot], boardRank, history)
+      let legal = legalActions(calibVariant, history)
+      let letter =
+        case event.action
+        of akFold: aFold
+        of akCheck, akCall: aCheckCall
+        of akBet, akRaise: aBetRaise
+      var slotOf = -1
+      for index, act in legal:
+        if act == letter:
+          slotOf = index
+      if slotOf >= 0:
+        if not observed[slot].hasKey(key):
+          observed[slot][key] = newSeq[int](legal.len)
+        observed[slot][key][slotOf].inc
+        inc decisions[slot]
+      history.add(actionLetter(letter))
+    else:
+      discard
+
+  for slot in 0 ..< n:
+    result.add(exploitabilityOf(calibVariant, observed[slot],
+      decisions[slot]))
+
+proc auditFromEvents*(config: GameConfig, events: seq[GameEvent]): JsonNode =
+  ## Collusion audit — a pure function of the event log plus the seed, so the
+  ## server and the wasm viewer compute identical output. Reporting only: it
+  ## never alters a score.
+  auditEvents(config, events)
+
+# ---- Match ------------------------------------------------------------------
+
+proc initMatch*(config: GameConfig): Match =
+  var settled = config
+  settled.validate()
+  if settled.seatOrder.len != settled.players.len:
+    settled.seatOrder = settled.seatOrderFor()
+  let names = tableNames(settled.players, settled.seed)
+  let n = settled.players.len
+  result = Match(
+    config: settled,
+    names: names,
+    net: newSeq[int](n),
+    handsWon: newSeq[int](n),
+    stackOffs: newSeq[int](n),
+    reason: erComplete
+  )
+  if settled.chipRace:
+    var stacks = newSeq[int](n)
+    for index in 0 ..< n:
+      stacks[index] = settled.startingStack
+    ## The opening button is drawn from the seed, like the deck and aliases.
+    let button = settled.seatOrder[((settled.seed mod n) + n) mod n]
+    result.sim = initHand(settled, 0, names, result.handsWon, result.net,
+      stacks = stacks, button = button)
+  else:
+    result.sim = initHand(settled, 0, names, result.handsWon, result.net)
+
+proc allEvents*(match: Match): seq[GameEvent] =
+  match.history & match.sim.events
+
+proc fundedSeats*(match: Match): int =
+  for seat in match.sim.seats:
+    if seat.stack > 0:
+      inc result
+
+proc finishHand*(match: var Match) =
+  ## Accounts the finished hand. Deliberately does NOT deal the next one — the
+  ## caller can stop between hands without a dealt-but-unplayed hand
+  ## corrupting the result.
+  if not match.sim.done or match.done:
+    raise newException(CosinoError, "no finished hand to fold in")
+  inc match.handsPlayed
+  if not match.sim.voided:
+    inc match.handsScored
+    for index in 0 ..< match.config.players.len:
+      if match.config.chipRace:
+        match.net[index] =
+          match.sim.seats[index].stack - match.config.startingStack
+      else:
+        match.net[index] +=
+          match.sim.seats[index].stack - match.config.startingStack
+        if match.config.variant == vHoldem and
+            match.sim.seats[index].stack == 0:
+          inc match.stackOffs[index]
+      match.handsWon[index] = match.sim.seats[index].handsWon
+  if match.handsPlayed >= match.config.hands or
+      (match.config.chipRace and match.fundedSeats() < 2):
+    match.done = true
+    match.reason = erComplete
+
+proc nextHand*(match: var Match) =
+  ## Deals the next hand of a live match.
+  if match.done or not match.sim.done:
+    raise newException(CosinoError, "the match is over or a hand is live")
+  if match.config.chipRace:
+    var stacks: seq[int]
+    for seat in match.sim.seats:
+      stacks.add(seat.stack)
+    ## The button walks clockwise around the ring to the next funded seat.
+    let n = stacks.len
+    var position = match.sim.posOf[match.sim.button]
+    var button = -1
+    for offset in 1 .. n:
+      let slot = match.sim.order[(position + offset) mod n]
+      if stacks[slot] > 0:
+        button = slot
+        break
+    let hand = match.sim.hand + 1
+    match.history.add(match.sim.events)
+    match.sim = initHand(match.config, hand, match.names,
+      match.handsWon, match.net, stacks = stacks, button = button)
+  else:
+    match.history.add(match.sim.events)
+    match.sim = initHand(match.config, match.sim.hand + 1, match.names,
+      match.handsWon, match.net)
+
+proc endMatchEarly*(match: var Match, reason: EndReason) =
+  ## Stop after the hand just scored. The hosted platform kills an episode
+  ## that outlives its timeout and keeps NOTHING, so a short honest match
+  ## always beats a long one that never lands.
+  match.done = true
+  match.reason = reason
+
+proc voidLiveHand*(match: var Match) =
+  ## The hard deadline caught a hand in progress.
+  match.sim.voidHand()
+  match.finishHand()
+
+proc pairsComplete*(match: Match): int =
+  match.handsScored div 2
+
+proc unpairedHands*(match: Match): int =
+  match.handsScored mod 2
+
+proc finishMatch*(match: var Match) =
+  ## Writes the load-bearing tail: one `calib` event per seat on the
+  ## calibration rungs, one `audit` event per flagged pair at six-max, and
+  ## `matchEnd` last, carrying the reason, the scored-hand count, the seed and
+  ## the whole audit object. Everything downstream re-derives from these.
+  if match.ended:
+    return
+  match.ended = true
+  match.done = true
+  let events = match.allEvents()
+  var tail: seq[GameEvent]
+
+  let calib = calibFromEvents(match.config, events)
+  for slot, entry in calib:
+    tail.add(GameEvent(
+      kind: evCalib, hand: max(match.sim.hand, 0), seat: slot,
+      street: stShowdown, stackAfter: -1, betAfter: -1, potAfter: -1,
+      pair: -1,
+      data: %*{
+        "exploitability": entry.exploitability,
+        "coverage": entry.coverage,
+        "fill": entry.fill,
+        "decisions": entry.decisions
+      }
+    ))
+
+  let auditNode = auditFromEvents(match.config, events)
+  for flag in auditNode["flagged"]:
+    tail.add(GameEvent(
+      kind: evAudit, hand: max(match.sim.hand, 0), seat: -1,
+      street: stShowdown, stackAfter: -1, betAfter: -1, potAfter: -1,
+      pair: -1, data: flag
+    ))
+
+  tail.add(GameEvent(
+    kind: evMatchEnd, hand: max(match.sim.hand, 0), seat: -1,
+    street: stShowdown, stackAfter: -1, betAfter: -1, potAfter: -1,
+    pair: -1,
+    data: %*{
+      "reason": $match.reason,
+      "handsScored": match.handsScored,
+      "seed": match.config.seed,
+      "audit": auditNode
+    }
+  ))
+  match.sim.events.add(tail)
+
+proc resultsFromEvents*(config: GameConfig, events: seq[GameEvent]): JsonNode =
+  ## The whole platform-facing result, re-derived from the recorded log. The
+  ## wall-clock stop is a recorded event, so a `deadline` episode re-derives
+  ## exactly like a `complete` one.
+  let n = config.players.len
+  var net = newSeq[int](n)
+  var handsWon = newSeq[int](n)
+  var stackOffs = newSeq[int](n)
+  var busted = newSeq[bool](n)
+  var handsPlayed = 0
+  var handsScored = 0
+  var reason = erComplete
+  var seed = config.seed
+  var auditNode = %*{"pairs": newJArray(), "flagged": newJArray(),
+    "power": %*{"hands": 0, "contestedMin": 0, "contestedMedian": 0,
+      "equitySamples": EquitySamples}}
+  var exploitability = newJArray()
+  var coverage = newJArray()
+  var fill = ""
+  var wonThisHand = newSeq[bool](n)
+  var explByseat = newSeq[JsonNode](n)
+  var covBySeat = newSeq[JsonNode](n)
+  for index in 0 ..< n:
+    explByseat[index] = newJNull()
+    covBySeat[index] = newJNull()
+
+  for event in events:
+    case event.kind
+    of evHandStart:
+      inc handsPlayed
+      for index in 0 ..< n:
+        wonThisHand[index] = false
+    of evAward:
+      if event.text != "returned" and event.seat >= 0 and
+          not wonThisHand[event.seat]:
+        wonThisHand[event.seat] = true
+        inc handsWon[event.seat]
+    of evStackOff:
+      if event.seat >= 0:
+        inc stackOffs[event.seat]
+    of evBust:
+      if event.seat >= 0:
+        busted[event.seat] = true
+    of evHandEnd:
+      if not event.data.isNil and event.data.hasKey("net"):
+        for index, value in event.data["net"].getElems():
+          if index < n:
+            net[index] = value.getInt()
+    of evCalib:
+      if event.seat >= 0 and event.seat < n and not event.data.isNil:
+        explByseat[event.seat] = event.data{"exploitability"}
+        covBySeat[event.seat] = event.data{"coverage"}
+        fill = event.data{"fill"}.getStr("")
+    of evMatchEnd:
+      if not event.data.isNil:
+        reason = parseEnum[EndReason](event.data{"reason"}.getStr("complete"))
+        handsScored = event.data{"handsScored"}.getInt(0)
+        seed = event.data{"seed"}.getInt(config.seed)
+        if event.data.hasKey("audit"):
+          auditNode = event.data["audit"]
+    else:
+      discard
+
+  for index in 0 ..< n:
+    exploitability.add(
+      if explByseat[index].isNil: newJNull() else: explByseat[index])
+    coverage.add(if covBySeat[index].isNil: newJNull() else: covBySeat[index])
+
+  let scale = max(handsScored, 1)
+  let unit = if config.variant == vHoldem: config.bigBlind else: config.ante
+  var best = low(int)
+  for value in net:
+    best = max(best, value)
+
+  var names = newJArray()
+  var scores = newJArray()
+  var winNode = newJArray()
+  var netNode = newJArray()
+  var netPerHand = newJArray()
+  var unitsPerHand = newJArray()
+  var handsWonNode = newJArray()
+  var stackOffsNode = newJArray()
+  var stacksNode = newJArray()
+  var bustedNode = newJArray()
+  var seatOrderNode = newJArray()
+  for index in 0 ..< n:
+    names.add(%config.players[index].name)
+    ## 1/n + net / (n * S * H): exactly [0, 1], summing to 1, and at H = 1 it
+    ## degenerates to a plain chip share. The chip race IS that degenerate
+    ## case: stacks carry, so the final net is one number and the score is
+    ## the final chip share.
+    let handsNorm = if config.chipRace: 1 else: handsScored
+    let share =
+      if handsScored == 0: 1.0 / n.float
+      else: 1.0 / n.float +
+        net[index].float /
+          (n.float * config.startingStack.float * handsNorm.float)
+    scores.add(%share)
+    winNode.add(%(net[index] == best))
+    netNode.add(%net[index])
+    netPerHand.add(%(net[index].float / scale.float))
+    unitsPerHand.add(%(net[index].float / (max(unit, 1).float * scale.float)))
+    handsWonNode.add(%handsWon[index])
+    stackOffsNode.add(%stackOffs[index])
+    if config.chipRace:
+      stacksNode.add(%(net[index] + config.startingStack))
+      bustedNode.add(%busted[index])
+  for slot in config.seatOrder:
+    seatOrderNode.add(%slot)
+
+  result = %*{
+    "names": names,
+    "scores": scores,
+    "win": winNode,
+    "net": netNode,
+    "netPerHand": netPerHand,
+    "unitsPerHand": unitsPerHand,
+    "handsWon": handsWonNode,
+    "stackOffs": stackOffsNode,
+    "exploitability": exploitability,
+    "exploitabilityCoverage": coverage,
+    "exploitabilityFill": fill,
+    "audit": auditNode,
+    "variant": $config.variant,
+    "chipRace": config.chipRace,
+    "seats": n,
+    "handsPlayed": handsPlayed,
+    "handsScored": handsScored,
+    "hands": config.hands,
+    "pairsComplete": (if config.duplicate: handsScored div 2 else: 0),
+    "unpairedHands": (if config.duplicate: handsScored mod 2 else: 0),
+    "startingStack": config.startingStack,
+    "ante": config.ante,
+    "smallBlind": config.smallBlind,
+    "bigBlind": config.bigBlind,
+    "seed": seed,
+    "seatOrder": seatOrderNode,
+    "reason": $reason
+  }
+  if config.chipRace:
+    ## The chip race's own read of the same numbers: the carried stack and
+    ## who busted out of it.
+    result["stacks"] = stacksNode
+    result["busted"] = bustedNode
+
+proc resultsJson*(match: Match, fallbacks: seq[int] = @[],
+    forcedFolds: seq[int] = @[], decisions: seq[int] = @[]): JsonNode =
+  let n = match.config.players.len
+  result = resultsFromEvents(match.config, match.allEvents())
+  var fallbackNode = newJArray()
+  var forcedNode = newJArray()
+  var decisionNode = newJArray()
+  for index in 0 ..< n:
+    fallbackNode.add(%(if index < fallbacks.len: fallbacks[index] else: 0))
+    forcedNode.add(%(if index < forcedFolds.len: forcedFolds[index] else: 0))
+    decisionNode.add(%(if index < decisions.len: decisions[index] else: 0))
+  result["fallbacks"] = fallbackNode
+  result["forcedFolds"] = forcedNode
+  result["decisions"] = decisionNode
+
+# ---- Viewer state -----------------------------------------------------------
+
+proc seatStates*(sim: Sim): JsonNode =
+  ## The seat panel every viewer draws. Hole cards ride along in full; the
+  ## server redacts them per player socket, spectators keep everything.
+  result = newJArray()
+  for index, seat in sim.seats:
+    var cardsNode = newJArray()
+    for card in seat.holeCards:
+      cardsNode.add(%card)
+    result.add(%*{
+      "name": seat.name,
+      "stack": seat.stack,
+      "bet": seat.committed,
+      "net": seat.net,
+      "cards": cardsNode,
+      "revealed": seat.revealed,
+      "folded": seat.folded,
+      "allIn": seat.allIn,
+      "out": seat.isOut,
+      "acting": index == sim.actingSeat,
+      "handsWon": seat.handsWon
+    })
+
+proc tableStateJson*(sim: Sim): JsonNode =
+  var boardNode = newJArray()
+  for card in sim.board:
+    boardNode.add(%card)
+  %*{
+    "seats": sim.seatStates(),
+    "board": boardNode,
+    "pot": sim.pot,
+    "street": $sim.street,
+    "hand": sim.hand,
+    "pair": sim.pair,
+    "mirror": sim.mirror,
+    "button": sim.button,
+    "currentBet": sim.currentBet,
+    "handDone": sim.done
+  }
+
+# ---- Replay -----------------------------------------------------------------
+
+type
+  ReplayFrame* = object
+    ## One scrub position: the reconstructed table after an event prefix
+    ## (frames[i] = state after events[0..<i]).
+    seats*: seq[Seat]
+    board*: seq[int]
+    pot*: int
+    street*: Street
+    hand*: int
+    pair*: int
+    mirror*: bool
+    button*: int
+    currentBet*: int
+    acting*: int      ## seat about to act (the next event's actor), or -1
+    handDone*: bool
+
+proc replayMatch*(config: GameConfig, events: seq[GameEvent]): seq[ReplayFrame] =
+  ## Re-derives the state timeline from a recorded event log. Events carry
+  ## amounts and stacks-after, so this never re-runs the betting engine.
+  let n = config.players.len
+  var frame = ReplayFrame(
+    street: stPreflop,
+    acting: -1,
+    button: -1,
+    pair: -1
+  )
+  var wonThisHand = newSeq[bool](n)
+  ## `net` on a frame is the cumulative net BEFORE the current hand's chips
+  ## move, so a viewer's running total is always net + (stack - startingStack).
+  ## The handEnd figure therefore lands at the NEXT handStart.
+  var pendingNet = newSeq[int](n)
+  for index in 0 ..< n:
+    frame.seats.add(Seat(
+      name:
+        if index < config.players.len: config.players[index].name
+        else: "Seat " & $(index + 1),
+      stack: config.startingStack
+    ))
+  result.add(frame)
+  for at, event in events:
+    case event.kind
+    of evHandStart:
+      frame.hand = event.hand
+      frame.button = event.seat
+      frame.pair = event.pair
+      frame.mirror = event.mirror
+      frame.board = @[]
+      frame.pot = 0
+      frame.street = stPreflop
+      frame.currentBet = 0
+      frame.handDone = false
+      for index in 0 ..< n:
+        ## The chip race carries the stack (and any bust) into the next hand;
+        ## the ladder resets every seat to the buy-in.
+        if not config.chipRace:
+          frame.seats[index].stack = config.startingStack
+        frame.seats[index].committed = 0
+        frame.seats[index].totalCommitted = 0
+        frame.seats[index].folded = false
+        frame.seats[index].allIn = false
+        frame.seats[index].holeCards = @[]
+        frame.seats[index].revealed = false
+        frame.seats[index].net = pendingNet[index]
+        wonThisHand[index] = false
+    of evDeal:
+      frame.seats[event.seat].holeCards = event.cards
+    of evAnte, evBlind, evAction:
+      if event.kind == evAction and event.action == akFold:
+        frame.seats[event.seat].folded = true
+      frame.seats[event.seat].totalCommitted +=
+        max(event.betAfter - frame.seats[event.seat].committed, 0)
+      frame.seats[event.seat].stack = event.stackAfter
+      frame.seats[event.seat].committed = event.betAfter
+      frame.seats[event.seat].allIn = event.allIn
+      frame.currentBet = max(frame.currentBet, event.betAfter)
+      frame.pot = event.potAfter
+      frame.street = event.street
+      if event.kind == evAnte:
+        ## Antes are dead money: nothing is owed to open the round.
+        var settled = true
+        for index in 0 ..< n:
+          if frame.seats[index].committed != frame.seats[0].committed:
+            settled = false
+        if settled:
+          for index in 0 ..< n:
+            frame.seats[index].committed = 0
+          frame.currentBet = 0
+    of evSay:
+      discard
+    of evBoard:
+      frame.board.add(event.cards)
+      frame.street = event.street
+      frame.currentBet = 0
+      for index in 0 ..< n:
+        frame.seats[index].committed = 0
+    of evReveal:
+      frame.seats[event.seat].holeCards = event.cards
+      frame.seats[event.seat].revealed = true
+      frame.street = event.street
+    of evAward:
+      frame.seats[event.seat].stack = event.stackAfter
+      frame.pot = event.potAfter
+      if event.text != "returned":
+        frame.street = event.street
+        if not wonThisHand[event.seat]:
+          wonThisHand[event.seat] = true
+          inc frame.seats[event.seat].handsWon
+    of evStackOff:
+      discard
+    of evBust:
+      frame.seats[event.seat].isOut = true
+    of evHandEnd:
+      frame.pot = 0
+      frame.handDone = true
+      if not event.data.isNil and event.data.hasKey("net"):
+        for index, value in event.data["net"].getElems():
+          if index < n:
+            pendingNet[index] = value.getInt()
+    of evHandVoid:
+      frame.pot = 0
+      frame.handDone = true
+      if not event.data.isNil and event.data.hasKey("refunds"):
+        for index, value in event.data["refunds"].getElems():
+          if index < n:
+            frame.seats[index].stack += value.getInt()
+            frame.seats[index].committed = 0
+    of evCalib, evAudit, evMatchEnd:
+      discard
+    ## Who is about to act: the actor of the next action event, if the very
+    ## next event is one.
+    frame.acting =
+      if at + 1 < events.len and events[at + 1].kind == evAction:
+        events[at + 1].seat
+      else:
+        -1
+    result.add(frame)
+
+proc frameStateJson*(frame: ReplayFrame): JsonNode =
+  ## Same shape as tableStateJson, derived from a replay frame.
+  var seatsNode = newJArray()
+  for index, seat in frame.seats:
+    var cardsNode = newJArray()
+    for card in seat.holeCards:
+      cardsNode.add(%card)
+    seatsNode.add(%*{
+      "name": seat.name,
+      "stack": seat.stack,
+      "bet": seat.committed,
+      "net": seat.net,
+      "cards": cardsNode,
+      "revealed": seat.revealed,
+      "folded": seat.folded,
+      "allIn": seat.allIn,
+      "out": seat.isOut,
+      "acting": index == frame.acting,
+      "handsWon": seat.handsWon
+    })
+  var boardNode = newJArray()
+  for card in frame.board:
+    boardNode.add(%card)
+  %*{
+    "seats": seatsNode,
+    "board": boardNode,
+    "pot": frame.pot,
+    "street": $frame.street,
+    "hand": frame.hand,
+    "pair": frame.pair,
+    "mirror": frame.mirror,
+    "button": frame.button,
+    "currentBet": frame.currentBet,
+    "handDone": frame.handDone
+  }
+
+proc statesFromEvents*(config: GameConfig, events: seq[GameEvent]): JsonNode =
+  ## One table-state object per event prefix, for scrubbing replays.
+  result = newJArray()
+  for frame in replayMatch(config, events):
+    result.add(frame.frameStateJson())
+
+proc configFromReplay*(payload: JsonNode): GameConfig =
+  result = defaultGameConfig()
+  let node = payload["config"]
+  result.variantDefaults(
+    parseEnum[Variant](node{"variant"}.getStr("holdem")))
+  result.startingStack = node{"startingStack"}.getInt(result.startingStack)
+  result.ante = node{"ante"}.getInt(result.ante)
+  result.smallBlind = node{"smallBlind"}.getInt(result.smallBlind)
+  result.bigBlind = node{"bigBlind"}.getInt(result.bigBlind)
+  result.hands = node{"hands"}.getInt(result.hands)
+  result.duplicate = node{"duplicate"}.getBool(true)
+  result.chipRace = node{"chipRace"}.getBool(false)
+  if result.chipRace:
+    result.duplicate = false
+  result.seed = node{"seed"}.getInt(0)
+  result.seatOrder = @[]
+  if node.hasKey("seatOrder"):
+    for slot in node["seatOrder"]:
+      result.seatOrder.add(slot.getInt())
+  ## The replay carries the episode's fitted table; never re-fit it.
+  result.sampled = true
+  for name in payload["names"]:
+    result.players.add(PlayerConfig(name: name.getStr()))
+
+proc replayConfigJson*(config: GameConfig): JsonNode =
+  var bets = newJArray()
+  for size in config.variant.betSizes(config.bigBlind):
+    bets.add(%size)
+  var seatOrderNode = newJArray()
+  for slot in config.seatOrder:
+    seatOrderNode.add(%slot)
+  %*{
+    "variant": $config.variant,
+    "seats": config.players.len,
+    "startingStack": config.startingStack,
+    "ante": config.ante,
+    "smallBlind": config.smallBlind,
+    "bigBlind": config.bigBlind,
+    "bets": bets,
+    "maxWagers": (
+      if config.variant.fixedLimit: config.variant.maxWagers() else: 0),
+    "hands": config.hands,
+    "duplicate": config.duplicate,
+    "chipRace": config.chipRace,
+    "seatOrder": seatOrderNode,
+    "seed": config.seed,
+    "sampled": true,
+    "gameVersion": GameVersion
+  }

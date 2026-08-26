@@ -3,17 +3,20 @@
   "tags": [
     "poker",
     "cards",
-    "llm-driven",
+    "imperfect-information",
     "no-limit-holdem",
+    "llm-driven",
+    "ladder",
     "turn-based"
   ],
+  "episode_timeout_minutes": 20,
   "game": {
     "name": "cosino",
+    "description": "Cosino is the imperfect-information house: one binary, one protocol, six tables of the same zero-sum game — a four-rung LADDER plus the classic chip-race CASH TABLES. Kuhn (3 cards, one betting round, 12 information sets) and Leduc (6 cards, two rounds) are exactly solvable, so a cog's EXPLOITABILITY is measured exactly and reported as a calibration number; no-limit Texas Hold'em heads-up and six-max are the full game. Every hand starts with every seat on the same stack - there are no busts and no carried chips - and hands are played in DUPLICATE PAIRS: hands 2k and 2k+1 come from the same shuffled deck with the table rotated by half a table, so deal luck cancels inside the pair. Seating is randomised from the seed. The two chip-race tables (headsup, sixmax) instead CARRY stacks between hands: the button walks to the next funded seat, a busted cog is out for good (no rebuys), and the final CHIP SHARE is the score, so protecting a short stack counts as much as building a tower. Score is cumulative NET chips, normalised to a [0,1] share that sums to 1 across seats, so a Kuhn episode and a six-max episode land on the same axis and one Elo ladder ranks all four rungs. At six-max a COLLUSION AUDIT measures per-pair equity surrender against the field and flags soft play and chip dumping - reporting only, never a score penalty. The game is LLM-driven: each decision the game server sends the acting seat's policy prompt plus its private cards and the public table state to Claude, so A POLICY IS JUST A PROMPT - build one by reusing the published player runnable and setting PLAYER_PROMPT. Two scripted baselines ship in the same image (PLAYER_SCRIPTED=house|rock): `house` is the exact alpha=1/6 Kuhn equilibrium, a Leduc rule table and cosino's Chen-formula Hold'em bot; `rock` is deterministic and deliberately exploitable. With no LLM credentials every seat plays scripted, so episodes always complete.",
+    "owner": "daveey@gmail.com",
     "replay_viewer": {
       "bundle": "static-replay-viewer"
     },
-    "description": "Cosino: no-limit Texas Hold'em for 2-6 cogs. Every seat buys in for the same stack (default 100 chips, blinds 1/2); the match plays a fixed number of hands and the final CHIP SHARE is the score, so protecting a short stack counts as much as building a tower. Full no-limit rules: min-raises, all-ins, side pots, split pots; busted cogs are out for good (no rebuys). Seats play under anonymous cog aliases so nobody can meta-game a familiar policy name. The game is LLM-driven: each turn the game server sends the acting seat's policy prompt plus its private cards and the public table state to Claude, so A POLICY IS JUST A PROMPT - build one by reusing the published player runnable and setting the PLAYER_PROMPT environment variable to your poker strategy (hand selection, bet sizing, table talk, tells). A built-in rule-based baseline (Chen-formula preflop, pot-odds postflop) plays any seat that registers as scripted - and every seat when no LLM credentials are available, so episodes always complete.",
-    "owner": "daveey@gmail.com",
     "runnable": {
       "type": "game",
       "image": "{{COSINO_IMAGE}}",
@@ -70,58 +73,92 @@
           "maximum": 6
         },
         "seed": {
-          "description": "Pins the shuffle, the button, and the seat aliases. Omit for a fresh random seed per episode.",
+          "description": "Pins the shuffle, the seating permutation, the aliases and the audit's Monte Carlo. Omit for a fresh random seed per episode.",
           "type": "integer"
         },
+        "variant": {
+          "description": "Which rung of the ladder this episode plays.",
+          "type": "string",
+          "enum": [
+            "kuhn",
+            "leduc",
+            "holdem"
+          ],
+          "default": "holdem"
+        },
         "startingStack": {
-          "description": "Chips each seat buys in for.",
+          "description": "Chips every seat holds at the start of EVERY hand. Stacks reset each hand; there are no busts.",
           "type": "integer",
-          "minimum": 10,
+          "minimum": 2,
           "maximum": 100000,
           "default": 100
         },
-        "smallBlind": {
-          "description": "Small blind.",
+        "ante": {
+          "description": "Ante posted by every seat on the calibration rungs; 0 at Hold'em.",
           "type": "integer",
-          "minimum": 1,
+          "minimum": 0,
+          "maximum": 1000,
+          "default": 0
+        },
+        "smallBlind": {
+          "description": "Small blind at Hold'em; 0 on the calibration rungs.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000,
           "default": 1
         },
         "bigBlind": {
-          "description": "Big blind; must exceed the small blind.",
+          "description": "Big blind at Hold'em; must exceed the small blind. 0 on the calibration rungs.",
           "type": "integer",
-          "minimum": 2,
+          "minimum": 0,
+          "maximum": 2000,
           "default": 2
         },
         "hands": {
-          "description": "Hand limit for the episode (capped by the model-call budget for the seat count; the match also ends when one cog holds every chip).",
+          "description": "Hand limit for the episode, capped at sample time by the 220-decision budget and rounded down to an even number so every duplicate pair is complete.",
           "type": "integer",
-          "minimum": 1,
+          "minimum": 2,
           "maximum": 500,
-          "default": 20
+          "default": 30
+        },
+        "duplicate": {
+          "description": "Play hands in mirrored duplicate pairs sharing one shuffled deck.",
+          "type": "boolean",
+          "default": true
+        },
+        "chipRace": {
+          "description": "Hold'em only: the classic Cosino chip race — stacks carry between hands, the button walks, busts are final, and the final chip share is the score. Excludes duplicate.",
+          "type": "boolean",
+          "default": false
+        },
+        "randomiseSeating": {
+          "description": "Derive the table-position permutation from the seed.",
+          "type": "boolean",
+          "default": true
         },
         "turnDelayMs": {
-          "description": "Spectator pacing delay between actions.",
+          "description": "Spectator pacing delay between decisions.",
           "type": "integer",
           "minimum": 0,
           "maximum": 10000,
-          "default": 900
+          "default": 250
         },
         "model": {
-          "description": "Claude model that drives every seat.",
+          "description": "Claude model that drives every seat on the non-Bedrock transport.",
           "type": "string",
           "default": "claude-sonnet-5"
         },
         "maxOutputTokens": {
           "type": "integer",
           "minimum": 64,
-          "maximum": 2000,
-          "default": 300
+          "maximum": 4000,
+          "default": 900
         },
         "llmTimeoutSeconds": {
           "type": "integer",
           "minimum": 5,
           "maximum": 300,
-          "default": 45
+          "default": 20
         },
         "player_connect_timeout_seconds": {
           "type": "number",
@@ -138,14 +175,13 @@
         "names",
         "scores",
         "win",
-        "stacks",
-        "handsWon",
-        "busted",
+        "net",
         "handsPlayed",
-        "hands",
-        "startingStack",
-        "smallBlind",
-        "bigBlind"
+        "handsScored",
+        "variant",
+        "seats",
+        "reason",
+        "chipRace"
       ],
       "properties": {
         "names": {
@@ -158,7 +194,7 @@
           }
         },
         "scores": {
-          "description": "Final chip share per seat (stack / total chips in play): in [0,1], summing to 1, comparable across episodes whatever the seat count.",
+          "description": "1/n + net/(n*S*H): in [0,1], summing to 1 across seats, comparable across rungs.",
           "type": "array",
           "minItems": 2,
           "maxItems": 6,
@@ -167,7 +203,7 @@
           }
         },
         "win": {
-          "description": "True for the seat(s) holding the biggest final stack.",
+          "description": "True for the seat(s) with the highest net.",
           "type": "array",
           "minItems": 2,
           "maxItems": 6,
@@ -175,14 +211,31 @@
             "type": "boolean"
           }
         },
-        "stacks": {
-          "description": "Final chip count per seat.",
+        "net": {
+          "description": "Cumulative net chips (won minus committed) over the scored hands. Sums to exactly 0.",
           "type": "array",
           "minItems": 2,
           "maxItems": 6,
           "items": {
-            "type": "integer",
-            "minimum": 0
+            "type": "integer"
+          }
+        },
+        "netPerHand": {
+          "description": "net / handsScored.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 6,
+          "items": {
+            "type": "number"
+          }
+        },
+        "unitsPerHand": {
+          "description": "net / (unit * handsScored), unit = bigBlind at Hold'em and ante on the calibration rungs.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 6,
+          "items": {
+            "type": "number"
           }
         },
         "handsWon": {
@@ -195,17 +248,152 @@
             "minimum": 0
           }
         },
-        "busted": {
-          "description": "True for seats that lost their whole stack.",
+        "stackOffs": {
+          "description": "Hands the seat finished with an empty stack. Cosmetic: stacks reset every hand.",
           "type": "array",
           "minItems": 2,
           "maxItems": 6,
           "items": {
-            "type": "boolean"
+            "type": "integer",
+            "minimum": 0
           }
         },
+        "stacks": {
+          "description": "Chip race only: each seat's final carried stack.",
+          "type": "array",
+          "items": {
+            "type": "integer"
+          },
+          "minItems": 2,
+          "maxItems": 6
+        },
+        "busted": {
+          "description": "Chip race only: seats that lost their last chip and sat out.",
+          "type": "array",
+          "items": {
+            "type": "boolean"
+          },
+          "minItems": 2,
+          "maxItems": 6
+        },
+        "fallbacks": {
+          "description": "Decisions where the model failed and the scripted baseline played instead.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 6,
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "forcedFolds": {
+          "description": "Decisions where even the baseline move was rejected and a fold was forced.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 6,
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "decisions": {
+          "description": "Decisions the seat was asked for.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 6,
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "exploitability": {
+          "description": "Chips per hand a perfect exploiter takes, at both positions. Null on the Hold'em rungs.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 6,
+          "items": {
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "exploitabilityCoverage": {
+          "description": "Fraction of reachable information sets the seat actually visited. Null on the Hold'em rungs.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 6,
+          "items": {
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "exploitabilityFill": {
+          "description": "How unvisited information sets were filled: 'nash' for Kuhn, 'uniform' for Leduc, empty at Hold'em.",
+          "type": "string"
+        },
+        "audit": {
+          "description": "Collusion audit. Reporting only: it never alters a score.",
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "pairs",
+            "flagged",
+            "power"
+          ],
+          "properties": {
+            "pairs": {
+              "description": "Per-pair statistics.",
+              "type": "array",
+              "minItems": 0,
+              "maxItems": 32,
+              "items": {
+                "type": "object"
+              }
+            },
+            "flagged": {
+              "description": "Flags raised, if any.",
+              "type": "array",
+              "minItems": 0,
+              "maxItems": 64,
+              "items": {
+                "type": "object"
+              }
+            },
+            "power": {
+              "description": "How much evidence the episode carries.",
+              "type": "object"
+            }
+          }
+        },
+        "variant": {
+          "description": "Which rung this episode played.",
+          "type": "string",
+          "enum": [
+            "kuhn",
+            "leduc",
+            "holdem"
+          ]
+        },
+        "chipRace": {
+          "description": "True when this episode was a chip-race table rather than a ladder rung.",
+          "type": "boolean"
+        },
+        "seats": {
+          "description": "Seat count.",
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 6
+        },
         "handsPlayed": {
-          "description": "Hands actually completed this episode.",
+          "description": "Hands dealt and finished, voided ones included.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "handsScored": {
+          "description": "Hands whose chips counted toward net.",
           "type": "integer",
           "minimum": 0
         },
@@ -214,7 +402,20 @@
           "type": "integer",
           "minimum": 1
         },
+        "pairsComplete": {
+          "description": "Complete duplicate pairs among the scored hands.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "unpairedHands": {
+          "description": "Scored hands left without their mirror.",
+          "type": "integer",
+          "minimum": 0
+        },
         "startingStack": {
+          "type": "integer"
+        },
+        "ante": {
           "type": "integer"
         },
         "smallBlind": {
@@ -222,23 +423,46 @@
         },
         "bigBlind": {
           "type": "integer"
+        },
+        "seed": {
+          "description": "The episode seed; the audit's Monte Carlo re-derives from it.",
+          "type": "integer"
+        },
+        "seatOrder": {
+          "description": "Slot sitting at each table position.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 6,
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "reason": {
+          "description": "How the episode ended.",
+          "type": "string",
+          "enum": [
+            "complete",
+            "deadline",
+            "budget"
+          ]
         }
       }
     },
     "protocols": {
       "player": {
         "type": "text",
-        "value": "cosino.player.v1 - JSON text frames over the websocket named by COWORLD_PLAYER_WS_URL (already carrying ?slot=N&token=T). A Cosino policy is a prompt: the player container's only job is to deliver it; the game server makes every decision by sending that prompt plus the seat's private cards and the public table state to Claude each turn. game->player frames: {\"type\":\"welcome\",\"protocol\":\"cosino.player.v1\",\"slot\":N,\"name\":str,\"startingStack\":int,\"smallBlind\":int,\"bigBlind\":int,\"hands\":int} on connect; {\"type\":\"state\",\"slot\":N,\"seats\":[{name,stack,bet,cards,revealed,folded,allIn,out,acting,handsWon}],\"board\":[...],\"pot\":int,\"events\":[...],\"done\":bool,...} after every action (hole cards other than your own are redacted until a showdown reveals them; cards are ints 0-51, rank=card div 4 with 0=deuce..12=ace, suit=card mod 4 as clubs/diamonds/hearts/spades); {\"type\":\"final\",\"done\":true,\"scores\":[...],\"win\":[...],\"names\":[...]} at game end, after which the player should exit. player->game frames: {\"type\":\"prompt\",\"prompt\":str,\"scripted\":bool} (prompt max 4000 chars; send after connect and again after welcome; the latest frame applies to all later turns; scripted:true plays the built-in rule-based baseline for this seat instead of the LLM). The published cosino-player runnable reads its prompt from the PLAYER_PROMPT environment variable (PLAYER_SCRIPTED=1 for the scripted baseline), so a new policy is `coworld upload-policy` of the same image with --secret-env PLAYER_PROMPT=\"<your strategy>\"."
+        "value": "cosino.player.v1 - JSON text frames over the websocket named by COWORLD_PLAYER_WS_URL (already carrying ?slot=N&token=T). An Cosino policy is a prompt: the player container's only job is to deliver it; the game server makes every decision by sending that prompt plus the seat's private cards and the public table state to Claude. game->player frames: {\"type\":\"welcome\",\"protocol\":\"cosino.player.v1\",\"slot\":N,\"name\":alias,\"variant\":\"kuhn\"|\"leduc\"|\"holdem\",\"startingStack\":int,\"ante\":int,\"smallBlind\":int,\"bigBlind\":int,\"hands\":int} on connect; {\"type\":\"state\",\"slot\":N,\"seats\":[{name,stack,bet,net,cards,revealed,folded,allIn,acting,handsWon}],\"board\":[ints],\"pot\":int,\"hand\":int,\"pair\":int,\"mirror\":bool,\"button\":int,\"currentBet\":int,\"events\":[...],\"done\":bool} after every event batch (hole cards other than your own are redacted until a showdown reveals them, and the spectator-only calib/audit events are stripped; cards are ints 0-51, rank=card div 4 with 0=deuce..12=ace, suit=card mod 4 as clubs/diamonds/hearts/spades); {\"type\":\"final\",\"done\":true,\"scores\":[...],\"win\":[...],\"names\":[aliases],\"net\":[...],\"handsPlayed\":N,\"reason\":\"complete\"|\"deadline\"|\"budget\"} at the end, after which the player exits 0. player->game frames: {\"type\":\"prompt\",\"prompt\":str,\"scripted\":bool,\"baseline\":\"house\"|\"rock\"} - prompt capped at 4000 characters, truncated on RUNE boundaries server-side; send it on connect and again after welcome (the re-send covers a race with slot registration); the latest frame wins for all later decisions. The published cosino-player runnable reads PLAYER_PROMPT (or PLAYER_SCRIPTED=house|rock for a baseline), so a new policy is `coworld upload-policy` of this same image with --secret-env PLAYER_PROMPT=\"<your strategy>\"."
       },
       "global": {
         "type": "text",
-        "value": "Global spectators connect a websocket to /global and receive the full snapshot as JSON after every action: {\"type\":\"state\",\"game\":\"cosino\",\"seats\":[{name,stack,bet,cards,revealed,folded,allIn,out,acting,handsWon}],\"board\":[ints],\"pot\":int,\"street\":str,\"hand\":int,\"button\":int,\"events\":[{kind:handStart|deal|blind|say|action|board|reveal|award|bust|handEnd,...}],\"handsPlayed\":int,\"hands\":int,\"started\":bool,\"done\":bool,\"connected\":[bool]}. Spectators see every hole card (that is the spectator's edge); the events array is append-only and carries the complete table transcript. The browser page at /client/global renders the table; /client/replay plays a recorded episode; the static replay viewer bundle renders replays hosted by the platform (index.html?replay=<url>)."
+        "value": "Global spectators connect a websocket to /global and receive the full snapshot as JSON after every decision: {\"type\":\"state\",\"game\":\"poker\",\"seats\":[{name,stack,bet,net,cards,revealed,folded,allIn,acting,handsWon}],\"board\":[ints],\"pot\":int,\"street\":str,\"hand\":int,\"pair\":int,\"mirror\":bool,\"button\":int,\"currentBet\":int,\"config\":{variant,seats,startingStack,ante,smallBlind,bigBlind,bets,maxWagers,hands,duplicate,seatOrder,seed,gameVersion},\"events\":[...],\"handsPlayed\":int,\"hands\":int,\"started\":bool,\"done\":bool,\"connected\":[bool]}. Event kinds: handStart (carries pair, mirror and data.positions), deal, ante, blind, say, action, board, reveal, award, stackOff, handEnd (data.net per slot), handVoid (data.refunds), calib (per-seat exploitability, calibration rungs only), audit (one per flagged pair at six-max) and matchEnd (data.reason/handsScored/seed/audit, always last). SPECTATORS SEE EVERY HOLE CARD - that is the spectator's edge. The browser page at /client/global renders the table; the static replay-viewer bundle renders hosted replays (index.html?replay=<url>) with no server in the loop at all."
       }
     },
     "docs": {
       "readme": {
         "type": "text",
-        "value": "Cosino is no-limit Texas Hold'em for 2-6 LLM-piloted cogs. Fixed buy-in, blinds, all-ins and side pots; a fixed number of hands; final chip share is the score and the biggest stack takes the table. A policy is just a prompt: field one by reusing the published cosino-player runnable with the PLAYER_PROMPT environment variable set to your strategy. The game server calls Claude with each seat's prompt, its private hole cards, and the public action; with no LLM credentials (or for seats that register scripted) it plays a rule-based baseline so episodes always complete."
+        "value": "Cosino is the imperfect-information house for LLM-piloted cogs: a ladder — Kuhn -> Leduc -> no-limit Hold'em heads-up -> no-limit Hold'em six-max — plus the classic chip-race cash tables, one binary and one protocol. On the ladder every hand starts from the same stack (no busts, no carried chips), hands are dealt in duplicate mirrored pairs so deal luck cancels, and the score is cumulative NET chips as a [0,1] share summing to 1. On the chip-race tables (headsup, sixmax) stacks carry between hands, busts are final, and the final chip share is the score. On the two calibration rungs a seat's exploitability against a perfect exploiter is computed EXACTLY and reported; at six-max a collusion audit flags soft play and chip dumping. Both are diagnostics: they never touch the score. A policy is just a prompt - field one by reusing the published cosino-player runnable with PLAYER_PROMPT set to your strategy. With no LLM credentials (or for seats registered scripted) the built-in baselines play, so episodes always complete."
       },
       "pages": [
         {
@@ -246,7 +470,23 @@
           "title": "rules.md",
           "content": {
             "type": "text",
-            "value": "# Cosino rules\n\n- Standard no-limit Texas Hold'em, 2-6 seats, one table.\n- Every seat starts with `startingStack` chips (default 100); blinds default 1/2 and never escalate.\n- The button walks clockwise each hand; heads-up, the button posts the small blind and acts first preflop.\n- Full no-limit betting: fold / check / call / bet / raise / all-in. Min-raise rules apply; a short all-in does not re-open the betting. Side pots form per commitment level; split pots share evenly with odd chips going clockwise from the button.\n- Uncalled bets return to the bettor. Folded chips stay in the pot.\n- A cog that loses its whole stack is OUT - no rebuys. Its seat folds every hand from there.\n- The match plays `hands` hands (fitted to the episode's model-call budget) or until one cog holds every chip.\n\n## Scoring\n\n`score = final stack / total chips in play` - the chip share, in [0,1], summing to 1 across seats. `win` marks the seat(s) with the biggest final stack. Every chip matters: folding a short stack to the money is real strategy, and so is pressing an edge to felt the table.\n\n## The meta\n\nEvery decision is made by Claude acting on a per-seat policy prompt plus that seat's private cards and the public table state. Seats play under anonymous cog aliases (policy names never reach the table). Table talk is public and free - bluff, needle, and mislead. Prompts that reason about pot odds, position, stack depth, and opponent patterns tend to win; a built-in scripted baseline (Chen-formula preflop, pot-odds postflop) fills seats without prompts and is a fieldable policy in its own right."
+            "value": "# Cosino rules\n\nFour ladder rungs of the same zero-sum imperfect-information game, plus the two chip-race cash tables. One episode is one rung.\n\n## What is the same everywhere\n\n- **Hands, not a chip race.** Every hand starts with every seat holding exactly `startingStack` chips. There are no busts, no rebuys and no seats sitting out; a seat that loses its whole hand-stack gets a cosmetic `stackOff` event and is full again next hand.\n- **Duplicate decks.** Hands are played in pairs. Hands `2k` and `2k+1` are dealt from the *same* shuffled deck; in the mirror hand the whole table rotates by half a table, so each seat gets the cards *and* the position its counterpart had. Deal luck cancels inside the pair. The mirror is invisible to the seats - an observation carries only the current hand.\n- **Randomised seating.** A seed-derived permutation maps table positions to slots, so a colluding pair cannot count on a fixed relative position.\n- **One actor at a time.** Poker is sequential: exactly one seat is on decision at any moment and one decision costs one model call.\n- **Anonymous aliases.** Seats play as Sprocket, Gizmo, Ratchet... No policy name ever enters a prompt.\n- **Table talk.** Every decision may carry one short public line (`say`, <= 120 runes).\n\n## Rung 1 - `kuhn` (2 seats)\n\nOpenSpiel `kuhn_poker`, exactly. Deck: J, Q, K of spades. Both seats ante 1. One private card each, dealt to position 0 then position 1. ONE betting round, bet size fixed at 1, AT MOST ONE wager (a bet; no raise). Position 0 (the button) acts first. Payoffs: `pp` showdown for 2 (+/-1); `pbp` the bettor takes 2 (+/-1); `pbb` showdown for 4 (+/-2); `bp` (+/-1); `bb` (+/-2). The three cards are distinct, so there is no split.\n\n## Rung 2 - `leduc` (2 seats)\n\nOpenSpiel `leduc_poker` defaults, exactly. Deck: J, Q, K in two suits. Both seats ante 1. One private card each. Round 1: fixed bet 2, at most 2 wagers (a bet and one raise). If both seats are live, ONE public board card is turned. Round 2: fixed bet 4, at most 2 wagers. Position 0 acts first in BOTH rounds - OpenSpiel does not switch the first actor between rounds, and the calibration rungs follow OpenSpiel so exploitability numbers are comparable with published ones. Showdown: a private card matching the board's rank is a pair and beats any unpaired hand; otherwise the higher rank wins; identical ranks split, odd chip to position 0.\n\n## Rung 3 - `holdem-hu` (2 seats) and `holdem-6max` (6 seats)\n\nStandard no-limit Texas Hold'em: min-raise rules, a short all-in that does not re-open the betting unless short increments accumulate to a full raise, side pots by commitment level, split pots with the odd chip clockwise from the button, uncalled bets returned. Blinds 1/2, never escalating; heads-up the button posts the small blind and acts first preflop, last afterwards.\n\n## Ending\n\n`results.reason` is exactly one of `complete` (the hand limit was reached), `deadline` (a wall-clock guard fired) or `budget` (the 220-decision allowance ran out). A hand abandoned by the hard deadline is refunded in full, recorded as `handVoid` and not scored, so the nets still sum to zero.\n\n## The chip-race tables\n\n`headsup` and `sixmax` are the classic Cosino cash game: the same no-limit Hold'em rules, but stacks CARRY between hands. The button walks clockwise to the next funded seat, a cog that loses its last chip is OUT for good (no rebuys), and the match ends at the hand limit or when one cog holds every chip. There are no duplicate pairs here — variance is part of the table — and the final CHIP SHARE is the score: `scores[i] = stack[i] / (n * startingStack)`, still exactly [0, 1] and summing to 1. The six-max collusion audit runs on the chip-race table too."
+          }
+        },
+        {
+          "id": "ladder.md",
+          "title": "ladder.md",
+          "content": {
+            "type": "text",
+            "value": "# The ladder and the score\n\n## One formula, all four rungs\n\nWith `n` seats, `S = startingStack`, `H` completed (scored) hands and `net[i]` seat i's cumulative chips won minus chips committed over those hands:\n\n```\nscores[i] = 1/n + net[i] / (n * S * H)\nwin[i]    = (net[i] == max(net))\n```\n\n`sum(net) == 0` exactly - a chip-conservation test enforces it - so `sum(scores) == 1`. The range is exactly [0, 1] with no clamping: the best possible net is `(n-1)*S*H` -> 1, the worst is `-S*H` -> 0. Positive is winning; a seat that breaks even scores exactly `1/n`. At `H = 1` this degenerates to a plain chip share.\n\nResults also carry the legible raw figures: `net[]`, `netPerHand[]` and `unitsPerHand[] = net[i] / (unit * H)`, where `unit` is the big blind at Hold'em and the ante on the calibration rungs.\n\n## Why one league across all four rungs\n\nThe score is unit-free - a share of the same virtual bankroll whatever the rung - so a Kuhn episode and a six-max episode contribute the same amount of Elo, and a single leaderboard is what makes this a *ladder* rather than three unrelated boards. Exploitability and the collusion audit are recorded DIAGNOSTICS in `results`, never inputs to the ranking; that keeps a noisy metric out of the Elo.\n\n## The decision budget\n\nPoker is sequential, so the budget is per decision, not per turn: 220 model calls per episode at ~3.0 s each is 660 s, exactly the soft guard (55% of 1200 s), which settles at the next duplicate-pair boundary. The hard guard at 672 s (56% of 1200 s) voids and refunds the live hand. It is checked BEFORE a decision, so it nets off one worst-case decision - a 2100 ms spacing floor, two 20 s model attempts, the turn delay and the settle write, about 45 s - which is what keeps the true worst-case settle inside 720 s, 60% of the platform's timeout. A 2100 ms floor between decision starts holds the episode under the Bedrock sidecar's 30-requests-per-minute cap. Each variant's hand count is declared to fit and is re-capped at sample time, rounded DOWN to an even number so every duplicate pair is complete.\n\n## The chip race is the degenerate case\n\nThe formula above with `H = 1` is a plain chip share, and that is exactly the chip-race score: stacks carry, so the whole match is one long `net` and `scores[i] = stack[i] / (n * S)`. One axis, all six tables."
+          }
+        },
+        {
+          "id": "audit.md",
+          "title": "audit.md",
+          "content": {
+            "type": "text",
+            "value": "# Exploitability and the collusion audit\n\nBoth are DIAGNOSTICS. Neither alters a score, disqualifies a seat, or feeds Elo.\n\n## Exploitability (calibration rungs only)\n\nMeasured exactly, for `kuhn` and `leduc`. For the Hold'em rungs `results.exploitability[i]` is `null` - no exact best response exists at no-limit scale and nothing here pretends otherwise.\n\n1. Every decision is tagged with its information set: the canonical `(position, private card, board card, betting history)` key of that variant's game tree. Over the episode this yields, per seat, observed action counts at each infoset, split by the position it played.\n2. Unvisited infosets are FILLED, and the fill is recorded: Kuhn fills with the known Nash strategy at alpha = 1/6 (`exploitabilityFill: \"nash\"`), Leduc fills uniformly (`\"uniform\"`, because Leduc has no closed form). `exploitabilityCoverage[i]` reports the fraction of reachable infosets the seat actually visited, so a thin sample is visible rather than hidden.\n3. `src/cosino/solve.nim` enumerates the whole game tree (Kuhn: 6 deals, 12 infosets; Leduc: 30 private deals x 4 board cards) and computes the best-response value by backward induction over counterfactual reach probabilities. No sampling, no CFR.\n4. Using the duplicate framing, `v_i = 1/2 [ u0(s_i^0, BR1(s_i^0)) + u1(BR0(s_i^1), s_i^1) ]` and `exploitability[i] = -v_i`, in chips per hand. It is >= 0, with equality exactly when the seat's empirical strategy is unexploitable at BOTH positions. The positional value of the game cancels in the average, so this needs no precomputed game value.\n\nThe `house` baseline's Kuhn table is exact Nash: its measured exploitability is 0 to within 1e-9, and a unit test asserts it.\n\n## The collusion audit (six-max)\n\nRuns when `n >= 3`. It is a PURE function of the event log plus the seed, so the server and the browser wasm viewer compute identical output.\n\n**Equity.** A seat's equity is its win-share probability given every live seat's actual hole cards, splits counted fractionally.\n\n- *Showdown slices* are priced on the **final board**: an exact evaluation, so equity is 0 or 1 up to splits and a hand played to completion books exactly zero surrender. This matters. Pricing a slice at the instant the last betting action completed - before the runout - books the realised cards of a single pre-river all-in as roughly half a stack of one-way \"surrender\", which is pure variance and cleared the 2 bb bar on 3 of 30 honest sixteen-hand episodes.\n- *Folds* are priced at the moment of the fold, against the hands still live, with the then-unknown board sampled by Monte Carlo over **2000 runouts** drawn from a seed derived from the replay's own seed, hand index and fold ordinal - deterministic and re-derivable from the replay bytes.\n\n**Surrender.** For every pot slice with contributor set C and contributions `contrib_c`: at showdown, `loss_a = eq_a * S_slice - actual_a`; on a fold, `loss_a = max(0, eqFold_a * potAtFold - callCost_a)` (folding correctly scores about zero; folding a hand worth more than the price scores the difference). Attribution is pro rata and **signed** - `surrender[a][b] += loss_a * contrib_b / sum_{c != a} contrib_c`, where a seat that wins more than its equity books a negative surrender, so symmetric variance cancels across hands rather than accumulating. `surrender`, `rate` and `bias` may therefore be negative; only positive bias can raise a flag. `contested[a][b]` counts hands in which a and b both put chips in the same pot. `flow[a][b]` is the pro-rata directed chip flow and `netFlow[a][b] = flow[a][b] - flow[b][a]` (reported, not used for flags).\n\n**Flags.**\n\n```\nrate[a][b] = surrender[a][b] / max(contested[a][b], 1)\nfield[a]   = sum_{c != a} surrender[a][c] / max(sum_{c != a} contested[a][c], 1)\nbias[a][b] = rate[a][b] - field[a]\n```\n\n- `soft-play` on the unordered pair {a,b} when `contested[a][b] >= 4` AND `min(bias[a][b], bias[b][a]) > 0.75 * bigBlind` - both directions leak, which is mutual soft play rather than one seat running the other over.\n- `dump-a-to-b` (directed) when `contested[a][b] >= 4` AND `bias[a][b] > 2.0 * bigBlind`. Chip dumping is one-directional, so it gets its own, higher threshold.\n\n`results.audit.power` carries `{hands, contestedMin, contestedMedian, equitySamples}` so a 14-hand episode's flags are read as the weak evidence they are. Every flagged pair is also written as one `audit` event at the tail of the event log, so the replay viewer shows it without re-solving. A pair may carry more than one flag: a mutual leak large enough also clears the one-way bar in both directions, and all three are reported.\n\n## What this audit does NOT catch\n\nBecause a completed hand books no showdown surrender, the whole signal comes from the **fold term**. The audit flags folding-good-hands collusion - chip dumping and soft play - and it does **not** flag the opposite vector, calling off with the worst of it to feed a partner. That one stays visible in the reported `netFlow[a][b]`, the pro-rata directed chip flow, which spectators and the league can read for themselves; it is reported for every pair and is never used for a flag. League-level aggregation of either signal across episodes is out of scope for v1."
           }
         }
       ]
@@ -257,7 +497,7 @@
       "id": "cosino-player",
       "name": "Cosino Prompt Player",
       "type": "player",
-      "description": "The reference Cosino policy: delivers its PLAYER_PROMPT (or a default solid-aggressive poker personality) to the game and spectates until the final frame. Field your own policy by uploading this same image with a different PLAYER_PROMPT.",
+      "description": "The reference Cosino policy: delivers its PLAYER_PROMPT (or a default balanced-poker personality) to the game and spectates until the final frame. Field your own policy by uploading this same image with a different PLAYER_PROMPT.",
       "image": "{{COSINO_IMAGE}}",
       "run": [
         "/bin/cosino-player"
@@ -274,16 +514,16 @@
       "source_url": "https://github.com/Metta-AI/cogame-cosino/tree/main"
     },
     {
-      "id": "cosino-shark",
-      "name": "Cosino Scripted Shark",
+      "id": "cosino-baseline",
+      "name": "Cosino House Baseline",
       "type": "player",
-      "description": "The scripted baseline as a fieldable policy: registers its seat as rule-based (Chen-formula preflop, made-hand strength and pot odds postflop) so the game server plays it deterministically, no LLM involved.",
+      "description": "The `house` baseline as a fieldable policy: the exact alpha=1/6 Kuhn equilibrium, a Leduc rule table, and a Chen-formula no-limit bot. The server plays it deterministically, no LLM involved.",
       "image": "{{COSINO_IMAGE}}",
       "run": [
         "/bin/cosino-player"
       ],
       "env": {
-        "PLAYER_SCRIPTED": "1"
+        "PLAYER_SCRIPTED": "house"
       },
       "resources": {
         "requests": {
@@ -299,9 +539,84 @@
   ],
   "variants": [
     {
-      "id": "sixmax",
-      "name": "Six-max table",
-      "description": "The standard table: six cogs, 100-chip stacks, 1/2 blinds, up to 30 hands (budget-fitted). Deep enough for real poker, short enough for an episode.",
+      "id": "kuhn",
+      "name": "Kuhn table (calibration)",
+      "description": "Rung 1: OpenSpiel kuhn_poker, heads-up. Three cards, one betting round, twelve information sets - small enough that a seat's exploitability against a perfect exploiter is computed exactly. 60 hands as 30 duplicate mirrored pairs.",
+      "game_config": {
+        "players": [
+          {
+            "name": "Player1"
+          },
+          {
+            "name": "Player2"
+          }
+        ],
+        "num_agents": 2,
+        "variant": "kuhn",
+        "startingStack": 20,
+        "ante": 1,
+        "smallBlind": 0,
+        "bigBlind": 0,
+        "hands": 60,
+        "duplicate": true,
+        "turnDelayMs": 250,
+        "player_connect_timeout_seconds": 180
+      }
+    },
+    {
+      "id": "leduc",
+      "name": "Leduc table (calibration)",
+      "description": "Rung 2: OpenSpiel leduc_poker defaults, heads-up. Six cards, two betting rounds, one public board card, a few hundred information sets - still exactly solvable, so exploitability is exact here too. 36 hands as 18 duplicate mirrored pairs.",
+      "game_config": {
+        "players": [
+          {
+            "name": "Player1"
+          },
+          {
+            "name": "Player2"
+          }
+        ],
+        "num_agents": 2,
+        "variant": "leduc",
+        "startingStack": 50,
+        "ante": 1,
+        "smallBlind": 0,
+        "bigBlind": 0,
+        "hands": 36,
+        "duplicate": true,
+        "turnDelayMs": 250,
+        "player_connect_timeout_seconds": 180
+      }
+    },
+    {
+      "id": "holdem-hu",
+      "name": "No-limit Hold'em, heads-up",
+      "description": "Rung 3a: full no-limit Texas Hold'em heads-up, 100-chip stacks reset every hand, blinds 1/2. Pure aggression and hand-reading, with duplicate mirrored pairs cancelling the deal luck. 30 hands as 15 pairs.",
+      "game_config": {
+        "players": [
+          {
+            "name": "Player1"
+          },
+          {
+            "name": "Player2"
+          }
+        ],
+        "num_agents": 2,
+        "variant": "holdem",
+        "startingStack": 100,
+        "ante": 0,
+        "smallBlind": 1,
+        "bigBlind": 2,
+        "hands": 30,
+        "duplicate": true,
+        "turnDelayMs": 250,
+        "player_connect_timeout_seconds": 180
+      }
+    },
+    {
+      "id": "holdem-6max",
+      "name": "No-limit Hold'em, six-max",
+      "description": "Rung 3b: six-handed no-limit Texas Hold'em, 100-chip stacks reset every hand, blinds 1/2, seating randomised from the seed. This is the rung the collusion audit runs on: per-pair equity surrender against the field, with soft-play and chip-dumping flags. 14 hands as 7 pairs.",
       "game_config": {
         "players": [
           {
@@ -324,18 +639,22 @@
           }
         ],
         "num_agents": 6,
+        "variant": "holdem",
         "startingStack": 100,
+        "ante": 0,
         "smallBlind": 1,
         "bigBlind": 2,
-        "hands": 20,
-        "turnDelayMs": 900,
+        "hands": 14,
+        "duplicate": true,
+        "randomiseSeating": true,
+        "turnDelayMs": 250,
         "player_connect_timeout_seconds": 180
       }
     },
     {
       "id": "headsup",
-      "name": "Heads-up",
-      "description": "Two cogs, 100-chip stacks, 1/2 blinds. Pure aggression and hand-reading; the budget affords a long match.",
+      "name": "Chip-race table, heads-up",
+      "description": "The classic Cosino cash table, heads-up: both cogs buy in for 100 chips at 1/2 blinds and play up to 20 hands with stacks CARRIED between hands. Busts are final (no rebuys) and the final chip share is the score, so protecting a short stack counts as much as building a tower.",
       "game_config": {
         "players": [
           {
@@ -346,11 +665,53 @@
           }
         ],
         "num_agents": 2,
+        "variant": "holdem",
+        "chipRace": true,
+        "duplicate": false,
         "startingStack": 100,
+        "ante": 0,
         "smallBlind": 1,
         "bigBlind": 2,
         "hands": 20,
-        "turnDelayMs": 900,
+        "turnDelayMs": 250,
+        "player_connect_timeout_seconds": 180
+      }
+    },
+    {
+      "id": "sixmax",
+      "name": "Chip-race table, six-max",
+      "description": "The classic Cosino cash table, six-handed: every cog buys in for 100 chips at 1/2 blinds and plays up to 16 hands with stacks CARRIED between hands and the button walking to the next funded seat. Busted cogs are out for good and the final chip share is the score. The collusion audit runs here too.",
+      "game_config": {
+        "players": [
+          {
+            "name": "Player1"
+          },
+          {
+            "name": "Player2"
+          },
+          {
+            "name": "Player3"
+          },
+          {
+            "name": "Player4"
+          },
+          {
+            "name": "Player5"
+          },
+          {
+            "name": "Player6"
+          }
+        ],
+        "num_agents": 6,
+        "variant": "holdem",
+        "chipRace": true,
+        "duplicate": false,
+        "startingStack": 100,
+        "ante": 0,
+        "smallBlind": 1,
+        "bigBlind": 2,
+        "hands": 16,
+        "turnDelayMs": 250,
         "player_connect_timeout_seconds": 180
       }
     }
@@ -363,19 +724,17 @@
         },
         {
           "name": "Gizmo"
-        },
-        {
-          "name": "Ratchet"
-        },
-        {
-          "name": "Widget"
         }
       ],
+      "num_agents": 2,
+      "variant": "kuhn",
       "seed": 7,
-      "startingStack": 60,
-      "smallBlind": 1,
-      "bigBlind": 2,
-      "hands": 8,
+      "startingStack": 20,
+      "ante": 1,
+      "smallBlind": 0,
+      "bigBlind": 0,
+      "hands": 12,
+      "duplicate": true,
       "turnDelayMs": 0,
       "player_connect_timeout_seconds": 180
     },
@@ -384,13 +743,7 @@
         "player_id": "cosino-player"
       },
       {
-        "player_id": "cosino-shark"
-      },
-      {
-        "player_id": "cosino-player"
-      },
-      {
-        "player_id": "cosino-shark"
+        "player_id": "cosino-baseline"
       }
     ]
   }

@@ -6,18 +6,18 @@
 ##   GET /client/player              - player page (view-only; policies are prompts)
 ##   GET /client/replay              - replay page (replay mode)
 ##   GET /client/renderer.js         - shared table renderer
+##   GET /client/chrome.css          - shared chrome
 ##   GET /client/assets/<name>       - sprites and fonts
 ##   WS  /player?slot=N&token=T      - player protocol (prompt delivery)
 ##   WS  /global                     - spectator snapshots
 ##   WS  /replay                     - replay payload (replay mode)
 ##
 ## Player protocol (cosino.player.v1), all JSON text frames:
-##   game -> player: {"type":"welcome","slot":N,"name":...}
+##   game -> player: {"type":"welcome","protocol":"cosino.player.v1",...}
 ##                   {"type":"state",...} after every event batch
-##                   {"type":"final","scores":[...],"win":[...]}
-##   player -> game: {"type":"prompt","prompt":"...","scripted":bool}
-##                   (max 4000 chars; scripted:true plays the built-in
-##                   rule-based baseline for that seat)
+##                   {"type":"final","done":true,"scores":[...],...}
+##   player -> game: {"type":"prompt","prompt":"...","scripted":bool,
+##                    "baseline":"house"|"rock"}   (prompt max 4000 runes)
 
 import
   std/[json, locks, os, sets, strutils, tables, times],
@@ -29,8 +29,12 @@ import
   sim
 
 const
-  MaxPromptLen = 4000
   ReplayVersion = 1
+  ## Bounded post-artifact grace: the certification runner pings /healthz and
+  ## /global AFTER the player pods start, and a short episode has already
+  ## written its artifacts by then (lantern 0.1.3 -> 0.1.4). The runner waits
+  ## on process exit anyway.
+  ShutdownGraceSeconds = 20
 
 type
   GameState = object
@@ -38,6 +42,10 @@ type
     match: Match
     prompts: seq[string]
     scripted: seq[bool]
+    baselines: seq[Baseline]
+    fallbacks: seq[int]
+    forcedFolds: seq[int]
+    decisions: seq[int]
     playerSockets: Table[int, WebSocket]
     socketSlots: Table[WebSocket, int]
     globalSockets: HashSet[WebSocket]
@@ -68,7 +76,7 @@ proc dataDir(): string =
   "data"
 
 proc policyNamesJson(gs: GameState): JsonNode =
-  ## Seats play under anonymous table names; the policy names ride alongside
+  ## Seats play under anonymous table aliases; the policy names ride alongside
   ## for the SPECTATOR views only, which render them in place of the aliases.
   result = newJArray()
   for player in gs.config.players:
@@ -86,9 +94,12 @@ proc snapshotJson(gs: GameState): JsonNode =
   result["game"] = %"cosino"
   result["policyNames"] = gs.policyNamesJson()
   result["events"] = events
+  result["config"] = replayConfigJson(gs.config)
   result["hands"] = %gs.config.hands
   result["handsPlayed"] = %gs.match.handsPlayed
+  result["variant"] = %($gs.config.variant)
   result["startingStack"] = %gs.config.startingStack
+  result["ante"] = %gs.config.ante
   result["smallBlind"] = %gs.config.smallBlind
   result["bigBlind"] = %gs.config.bigBlind
   result["started"] = %gs.started
@@ -97,15 +108,17 @@ proc snapshotJson(gs: GameState): JsonNode =
 
 proc redactCards(snapshot: JsonNode, slot: int) =
   ## Hole cards are secret: a player sees only its own, plus whatever the
-  ## showdown made public (revealed seats and reveal events survive the
-  ## redaction). The global viewer keeps everything — that is the
-  ## spectator's edge.
+  ## showdown made public. The calibration and audit tails are spectator-only
+  ## diagnostics and are stripped as well.
   for index, seat in snapshot["seats"].getElems():
     if index != slot and not seat{"revealed"}.getBool(false):
       seat["cards"] = newJArray()
   var visible = newJArray()
   for event in snapshot["events"]:
-    if event{"kind"}.getStr() == "deal" and event{"seat"}.getInt() != slot:
+    let kind = event{"kind"}.getStr()
+    if kind == "deal" and event{"seat"}.getInt() != slot:
+      continue
+    if kind in ["calib", "audit"]:
       continue
     visible.add(event)
   snapshot["events"] = visible
@@ -119,8 +132,8 @@ proc broadcastLocked(gs: GameState) =
     var observation = gs.snapshotJson()
     observation["slot"] = %slot
     observation.redactCards(slot)
-    ## Players never learn who is behind a seat — that is the whole point
-    ## of the aliases — so the policy-name map is spectator-only.
+    ## Players never learn who is behind a seat — that is the whole point of
+    ## the aliases — so the policy-name map is spectator-only.
     observation.delete("policyNames")
     socket.send($observation)
 
@@ -135,8 +148,7 @@ proc writeArtifact(uri, data, contentType, methodEnv: string) =
     headers["content-type"] = contentType
     let response = curl.post(uri, headers, data, 60)
     if response.code < 200 or response.code >= 300:
-      raise newException(IOError,
-        "artifact POST failed: " & $response.code)
+      raise newException(IOError, "artifact POST failed: " & $response.code)
   else:
     writeCogameUri(uri, data, contentType, methodEnv)
 
@@ -151,23 +163,10 @@ proc replayPayload(gs: GameState, results: JsonNode): string =
     "protocol": "cosino.replay.v" & $ReplayVersion,
     "names": names,
     "policyNames": gs.policyNamesJson(),
-    "config": {
-      "startingStack": gs.config.startingStack,
-      "smallBlind": gs.config.smallBlind,
-      "bigBlind": gs.config.bigBlind,
-      "hands": gs.config.hands,
-      "sampled": true,
-      "seed": gs.config.seed
-    },
+    "config": replayConfigJson(gs.config),
     "events": events,
     "results": results
   }
-
-proc statesFromEvents(config: GameConfig, events: seq[GameEvent]): JsonNode =
-  ## One table-state object per event prefix, for scrubbing replays.
-  result = newJArray()
-  for frame in replayMatch(config, events):
-    result.add(frame.frameStateJson())
 
 proc finishEpisode(runtimeConfig: RuntimeConfig) =
   var results: JsonNode
@@ -176,14 +175,15 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
     if state.finished:
       return
     state.finished = true
-    results = state.match.resultsJson()
+    state.match.finishMatch()
+    results = state.match.resultsJson(state.fallbacks, state.forcedFolds,
+      state.decisions)
     replayData = state.replayPayload(results)
 
     ## Send final frames to players BEFORE writing artifacts: the hosted
     ## worker tears player pods down as soon as results.json exists, and
-    ## writing first would race player log collection.
-    ## Results carry POLICY names for the platform, but the final frame
-    ## goes to the player sockets — hand them the table aliases instead.
+    ## writing first would race player log collection. Results carry POLICY
+    ## names for the platform; the players get the table aliases.
     var aliasNames = newJArray()
     for seat in state.match.sim.seats:
       aliasNames.add(%seat.name)
@@ -193,9 +193,9 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
       "scores": results["scores"],
       "win": results["win"],
       "names": aliasNames,
-      "stacks": results["stacks"],
-      "handsWon": results["handsWon"],
-      "handsPlayed": results["handsPlayed"]
+      "net": results["net"],
+      "handsPlayed": results["handsPlayed"],
+      "reason": results["reason"]
     }
     for slot, socket in state.playerSockets:
       final["slot"] = %slot
@@ -212,14 +212,11 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
     runtimeConfig.replayUri, replayData, "application/octet-stream",
     "COGAME_SAVE_REPLAY_METHOD"
   )
-  sleep(500)
+  echo "cosino: artifacts written; holding the routes open for ",
+    ShutdownGraceSeconds, "s"
+  sleep(ShutdownGraceSeconds * 1000)
   echo "cosino: episode complete, shutting down"
   quit(0)
-
-const PlayBudgetFraction* = 0.6
-  ## Share of the platform's episode timeout spent playing. The rest covers
-  ## container start, player connects, and writing the artifacts — the part
-  ## that must never be the thing that runs out of time.
 
 proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
   {.gcsafe.}:
@@ -243,66 +240,76 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
 
     let client = newLlmClient(config)
 
-    ## The platform hands the container its own kill time. Play inside a
-    ## fraction of it so results and the replay are written with room to
-    ## spare — an episode that overruns is discarded whole.
+    ## The game container is NOT given COWORLD_TIMEOUT_SECONDS (only the
+    ## worker sidecar is), so assume the platform's 1200 s when it is absent
+    ## and play well inside it. An episode that overruns is discarded whole.
     let hostedTimeout = getEnv("COWORLD_TIMEOUT_SECONDS", "").strip()
     let timeoutSeconds =
       if hostedTimeout.len > 0:
-        try: parseFloat(hostedTimeout) except ValueError: 0.0
-      else: 0.0
-    let playDeadline =
-      if timeoutSeconds > 0.0: gameStart + timeoutSeconds * PlayBudgetFraction
-      else: 0.0
-    if playDeadline > 0.0:
-      echo "cosino: episode timeout ", timeoutSeconds.int, "s; playing until ",
-        (timeoutSeconds * PlayBudgetFraction).int, "s"
+        try: parseFloat(hostedTimeout)
+        except ValueError: DefaultEpisodeTimeoutSeconds
+      else: DefaultEpisodeTimeoutSeconds
+    let softDeadline = gameStart + timeoutSeconds * PlayBudgetFraction
+    let hardDeadline = gameStart + timeoutSeconds * HardDeadlineFraction
+    echo "cosino: episode timeout ", timeoutSeconds.int, "s; soft stop at ",
+      (timeoutSeconds * PlayBudgetFraction).int, "s, hard stop at ",
+      (timeoutSeconds * HardDeadlineFraction).int, "s"
+
+    var spent = 0
 
     proc matchHeader(): string =
       "Hand " & $(state.match.sim.hand + 1) & " of " &
-        $state.config.hands & " in the match."
+        $state.config.hands & " in the match (" & $state.config.variant & ")."
 
     while true:
       var simCopy: Sim
       var seat: int
       var seatPrompt: string
       var seatScripted: bool
+      var seatBaseline: Baseline
       var header: string
+      var stopNow = false
       withLock stateLock:
         if state.match.done:
-          break
-        simCopy = state.match.sim
-        seat = state.match.sim.actingSeat
-        if seat < 0:
-          ## Should not happen: a live hand always has an actor.
-          echo "cosino: no acting seat on a live hand; ending match"
-          state.match.endMatchEarly()
-          break
-        seatPrompt = state.prompts[seat]
-        seatScripted = state.scripted[seat]
-        header = matchHeader()
+          stopNow = true
+        elif epochTime() > hardDeadline:
+          ## Hard guard, checked before EVERY decision: abandon the live hand,
+          ## refund every chip in it (so the nets still sum to zero), stop.
+          echo "cosino: hard deadline reached mid-hand; voiding hand ",
+            state.match.sim.hand + 1
+          state.match.voidLiveHand()
+          state.match.endMatchEarly(erDeadline)
+          state.broadcastLocked()
+          stopNow = true
+        else:
+          simCopy = state.match.sim
+          seat = state.match.sim.actingSeat
+          if seat < 0:
+            echo "cosino: no acting seat on a live hand; ending match"
+            state.match.endMatchEarly(erComplete)
+            stopNow = true
+          else:
+            seatPrompt = state.prompts[seat]
+            seatScripted = state.scripted[seat]
+            seatBaseline = state.baselines[seat]
+            header = matchHeader()
+      if stopNow:
+        break
 
-      ## The slow part (Claude) runs outside the lock on a snapshot; only
-      ## this thread mutates the match, so the snapshot cannot go stale.
+      ## The slow part (Claude) runs outside the lock on a snapshot; only this
+      ## thread mutates the match, so the snapshot cannot go stale.
       let decision = client.decide(simCopy, seat, seatPrompt,
-        scripted = seatScripted, header = header)
+        scripted = seatScripted, baseline = seatBaseline, header = header)
+      inc spent
 
       var handEnded = false
       withLock stateLock:
-        state.match.sim.recordSay(seat, decision.say)
-        try:
-          state.match.sim.applyAction(seat, decision.action)
-        except CosinoError as error:
-          echo "cosino: llm action rejected (", error.msg,
-            "); using scripted fallback"
-          let fallback = client.scriptedAction(state.match.sim, seat)
-          try:
-            state.match.sim.applyAction(seat, fallback.action)
-          except CosinoError as inner:
-            ## Folding is always legal; the hand must advance.
-            echo "cosino: fallback rejected too (", inner.msg, "); folding"
-            state.match.sim.applyAction(seat,
-              PlayerAction(kind: akFold))
+        inc state.decisions[seat]
+        ## Degrade twice, never hang: illegal -> baseline -> fold.
+        let outcome = client.applyDecision(state.match.sim, seat, decision,
+          seatBaseline)
+        state.fallbacks[seat] += outcome.fallbacks
+        state.forcedFolds[seat] += outcome.forcedFolds
         if state.match.sim.done:
           state.match.finishHand()
           handEnded = true
@@ -315,15 +322,20 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         var done = false
         withLock stateLock:
           done = state.match.done
-          if not done and playDeadline > 0.0 and epochTime() > playDeadline:
-            ## The platform kills an episode that outruns its timeout and
-            ## keeps nothing at all, so give up hands rather than the whole
-            ## result. Checked between hands: a part-played hand has no pot
-            ## to settle.
-            echo "cosino: episode deadline reached after ",
+          ## Soft guards are checked at a PAIR boundary so no duplicate pair
+          ## is left half-played.
+          let atBoundary = not config.duplicate or
+            (state.match.handsPlayed mod 2 == 0)
+          if not done and atBoundary and spent >= EpisodeDecisionBudget:
+            echo "cosino: decision budget spent after ",
+              state.match.handsPlayed, " hands; settling here"
+            state.match.endMatchEarly(erBudget)
+            done = true
+          if not done and atBoundary and epochTime() > softDeadline:
+            echo "cosino: soft deadline reached after ",
               state.match.handsPlayed, "/", config.hands,
-              " hands; ending the match here"
-            state.match.endMatchEarly()
+              " hands; settling here"
+            state.match.endMatchEarly(erDeadline)
             done = true
           if not done:
             state.match.nextHand()
@@ -373,10 +385,7 @@ proc rendererHandler(request: Request) {.gcsafe.} =
 
 proc chromeCssHandler(request: Request) {.gcsafe.} =
   {.gcsafe.}:
-    serveFile(
-      request, clientDir() / "chrome.css",
-      "text/css; charset=utf-8"
-    )
+    serveFile(request, clientDir() / "chrome.css", "text/css; charset=utf-8")
 
 proc healthzHandler(request: Request) {.gcsafe.} =
   var headers: HttpHeaders
@@ -410,7 +419,9 @@ proc playerUpgradeHandler(request: Request) {.gcsafe.} =
         "protocol": "cosino.player.v1",
         "slot": slot,
         "name": state.match.sim.seats[slot].name,
+        "variant": $state.config.variant,
         "startingStack": state.config.startingStack,
+        "ante": state.config.ante,
         "smallBlind": state.config.smallBlind,
         "bigBlind": state.config.bigBlind,
         "hands": state.config.hands
@@ -439,9 +450,9 @@ proc websocketHandler(
     of OpenEvent:
       discard
     of MessageEvent:
-      ## mummy hands Ping frames to the application instead of answering
-      ## them itself; the platform's certifier pings /global to check the
-      ## game is alive, so an unanswered ping fails certification.
+      ## mummy hands Ping frames to the application instead of answering them
+      ## itself; the platform's certifier pings /global to check the game is
+      ## alive, so an unanswered ping fails certification.
       if message.kind == Ping:
         websocket.send(message.data, Pong)
         return
@@ -455,15 +466,17 @@ proc websocketHandler(
       try:
         let payload = parseJson(message.data)
         if payload{"type"}.getStr() == "prompt":
-          var prompt = payload{"prompt"}.getStr()
-          if prompt.len > MaxPromptLen:
-            prompt = prompt[0 ..< MaxPromptLen]
+          ## Rune-truncated, never byte-truncated: a byte cut mid-rune renders
+          ## in a browser and then fails a strict UTF-8 parser downstream.
+          let prompt = truncateRunes(payload{"prompt"}.getStr(), MaxPromptLen)
           let scripted = payload{"scripted"}.getBool(false)
+          let baseline = parseBaseline(payload{"baseline"}.getStr("house"))
           withLock stateLock:
             state.prompts[slot] = prompt
             state.scripted[slot] = scripted
-          echo "cosino: slot ", slot, " delivered a prompt (",
-            prompt.len, " chars", (if scripted: ", scripted" else: ""), ")"
+            state.baselines[slot] = baseline
+          echo "cosino: slot ", slot, " delivered a prompt (", prompt.len,
+            " chars", (if scripted: ", scripted " & $baseline else: ""), ")"
       except CatchableError as error:
         echo "cosino: ignoring bad player frame: ", error.msg
     of ErrorEvent:
@@ -490,21 +503,9 @@ proc buildRouter(replayMode: bool): Router =
   if not replayMode:
     result.get("/player", playerUpgradeHandler)
 
-proc configFromReplay*(payload: JsonNode): GameConfig =
-  result = defaultGameConfig()
-  result.startingStack = payload["config"]{"startingStack"}.getInt(100)
-  result.smallBlind = payload["config"]{"smallBlind"}.getInt(1)
-  result.bigBlind = payload["config"]{"bigBlind"}.getInt(2)
-  result.hands = payload["config"]{"hands"}.getInt(30)
-  result.seed = payload["config"]{"seed"}.getInt(0)
-  ## The replay carries the episode's fitted table; never re-fit it.
-  result.sampled = true
-  for name in payload["names"]:
-    result.players.add(PlayerConfig(name: name.getStr()))
-
 proc runReplayServer*(runtimeConfig: RuntimeConfig) =
-  ## Replay mode: parse the recorded replay, precompute the scrub states,
-  ## and serve the viewer until the platform tears the container down.
+  ## Replay mode: parse the recorded replay, precompute the scrub states, and
+  ## serve the viewer until the platform tears the container down.
   let payload = parseJson(runtimeConfig.replay)
   let config = configFromReplay(payload)
   var events: seq[GameEvent]
@@ -532,8 +533,16 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
     raise newException(CosinoError, "tokens and players must align")
   state.config = config
   state.match = initMatch(config)
-  state.prompts = newSeq[string](config.players.len)
-  state.scripted = newSeq[bool](config.players.len)
+  ## initMatch settles the seed-derived seating; keep the served config in
+  ## step so the replay carries the order the hands were actually dealt with.
+  state.config = state.match.config
+  let n = config.players.len
+  state.prompts = newSeq[string](n)
+  state.scripted = newSeq[bool](n)
+  state.baselines = newSeq[Baseline](n)
+  state.fallbacks = newSeq[int](n)
+  state.forcedFolds = newSeq[int](n)
+  state.decisions = newSeq[int](n)
   runtimeConfigGlobal = runtimeConfig
 
   let router = buildRouter(replayMode = false)

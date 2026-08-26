@@ -1,6 +1,6 @@
 version     = "0.1.0"
 author      = "daveey"
-description = "Cosino: LLM-driven no-limit Texas Hold'em for the Softmax Coworld platform. 2-6 cogs at a felt table; a policy is just a prompt; chip share is the score."
+description = "Cosino: poker for the Softmax Coworld platform - the Kuhn -> Leduc -> no-limit Hold'em ladder plus the classic chip-race tables. A policy is just a prompt."
 license     = "MIT"
 
 srcDir = "src"

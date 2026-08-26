@@ -15,6 +15,10 @@ if [[ "${output_dir}" != /* ]]; then
   echo "output dir must be absolute: ${output_dir}" >&2
   exit 1
 fi
+# The output's PARENT does not exist on a fresh CI checkout (`coworld build`
+# pre-creates it, ci.yml does not), and the containment check below resolves
+# through it (ecos, 2026-08-23).
+mkdir -p "$(dirname "${output_dir}")"
 
 export PATH="$HOME/.nimby/nim/bin:$PATH"
 
@@ -56,4 +60,5 @@ done
 
 test -f "${output_dir}/index.html"
 grep -q 'data-replay' "${output_dir}/static_replay.js"
+grep -q 'CosinoReplayModule(' "${output_dir}/static_replay.js"
 echo "cosino replay viewer bundle: ${output_dir}"

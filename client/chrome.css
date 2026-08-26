@@ -420,3 +420,162 @@ body.feed-collapsed #feed { display: none; }
 .end-row-winner .end-cell.name { color: var(--tc, var(--amber)); }
 
 .feed-score { color: var(--tc, var(--amber)); font-weight: 600; }
+
+/* ==== cosino game block (appended; nothing above this line is edited) ==== */
+
+/* Six seats, not five: cosino hard-codes repeat(5, 1fr) and the sixth plate
+   wraps onto a second row at 6-max. Auto-fit keeps the scorebug one row and
+   lets it shrink into the 360px featured-match iframe. */
+#scorebug {
+  grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+}
+
+/* renderer.js's COLORS has six entries; cosino's chrome stops at .seat4, so
+   the sixth seat's plate and scrubber beats render colourless at 6-max. */
+:root { --orange: #e08a3a; }
+.seat5 { --tc: var(--orange); }
+
+/* The featured-match iframe on softmax.com is ~360px wide; with flex: 0 1 auto
+   every name collapses to a single ellipsis. */
+.plate-name { flex: 1 1 auto; min-width: 3.2em; }
+@media (max-width: 640px) {
+  /* The chips-in-front figure goes with its neighbours: unlabelled it reads
+     as a second net. The signed net is the headline and stays. */
+  .plate-label, .plate-pips, .plate-front { display: none; }
+}
+
+/* Legibility at 360px is a requirement, checked at 360px, not at desktop. */
+@media (max-width: 400px) {
+  #wordmark { font-size: 15px }
+  #clock { font-size: 12px }
+  .plate-score { font-size: 15px }
+  #feed { display: none }
+  /* With the feed gone there is nothing to toggle, and the top band has room
+     for the rung chip -- which is the one thing telling a 360px spectator
+     which rung of the ladder they are watching. */
+  #feedtoggle, #statuschip { display: none }
+}
+
+/* Transport band + HUD scale, published on :root by relayout(). Nothing this
+   game adds is ever drawn over the transport: every overlay is anchored to
+   bottom: var(--band). */
+:root { --band: 0px; --hudscale: 1; }
+#topband { font-size: calc(1em * var(--hudscale)); }
+#scorebug { font-size: calc(1em * var(--hudscale)); }
+#rungchip {
+  font-family: var(--pixfont);
+  font-size: calc(11px * var(--hudscale));
+  letter-spacing: 0.14em;
+  color: var(--ink);
+  background: var(--amber);
+  padding: 2px 7px;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+#rungchip:empty { display: none; }
+
+/* The endcard stops at the transport band instead of covering the scrubber. */
+#endscreen { bottom: var(--band); top: 0; inset: auto 0 var(--band) 0; }
+
+/* The collusion panel, hidden unless the replay carries audit findings. */
+#auditcard {
+  position: absolute;
+  right: 10px;
+  bottom: calc(var(--band) + 10px);
+  max-width: 320px;
+  display: none;
+  padding: 8px 10px;
+  background: rgba(22, 17, 13, 0.92);
+  border: 1px solid var(--violet);
+  font-family: var(--pixfont);
+  font-size: calc(11px * var(--hudscale));
+  color: var(--paper-dim);
+  z-index: 7;
+}
+#auditcard.show { display: block; }
+.audit-head {
+  font-family: var(--finefont);
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  color: var(--violet);
+  margin-bottom: 4px;
+}
+.audit-row { color: var(--paper); margin-bottom: 2px; }
+.audit-flag { color: var(--violet); font-weight: 700; }
+.audit-power { margin-top: 4px; font-size: 9px; color: var(--ghost); }
+
+/* Scrubber beats are clickable, labelled buttons. EVERY kind emitted by
+   buildCosinoBeats has a rule here, and ci.yml greps for that pairing. */
+.beat-marker {
+  appearance: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+.beat-marker:hover { outline: 1px solid var(--paper); }
+.beat-marker.award { top: 6px; height: 8px; width: 2px; }
+.beat-marker.showdown {
+  top: 5px; height: 10px; width: 2px;
+  background: var(--paper);
+}
+.beat-marker.stackoff {
+  top: 2px; height: 14px; width: 3px;
+  background: var(--red);
+}
+.beat-marker.bust {
+  top: 0; height: 16px; width: 4px;
+  background: var(--red);
+  box-shadow: 0 0 6px var(--red);
+}
+.beat-marker.mirror {
+  top: 0; height: 9px; width: 8px;
+  transform: translateX(-4px);
+  background: var(--amber);
+  box-shadow: 0 0 6px var(--amber);
+}
+.beat-marker.void {
+  top: 3px; height: 12px; width: 3px;
+  background: var(--ghost);
+}
+.beat-marker.audit {
+  top: 0; height: 9px; width: 8px;
+  transform: translateX(-4px);
+  background: var(--violet);
+  box-shadow: 0 0 6px var(--violet);
+}
+
+/* Scorebug plate: the big number is signed NET chips, with the chips in
+   front this hand beside it. */
+.plate-score { min-width: 2.4em; }
+.plate-front {
+  font-family: var(--finefont);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  color: var(--amber);
+  flex: none;
+}
+.plate-front:empty { display: none; }
+
+/* Feed: the calibration and audit tails. */
+.feed-calib { color: var(--blue); }
+.feed-audit { color: var(--violet); font-weight: 700; }
+.feed-handVoid { color: var(--ghost); font-style: italic; }
+.feed-matchEnd { color: var(--amber); font-weight: 700; }
+.feed-ante { color: var(--paper-dim); }
+.feed-stackOff { color: var(--red); }
+
+/* Endcard: the flagged-pairs block under the ranked rows. */
+.end-flags {
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(242, 232, 216, 0.16);
+}
+.end-flags-head {
+  font-family: var(--finefont);
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--violet);
+  margin-bottom: 4px;
+}
+.end-flag-row { font-size: 13px; color: var(--paper-dim); }

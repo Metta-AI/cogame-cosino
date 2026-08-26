@@ -14,6 +14,7 @@
       <div id="topright">
         <span id="statuschip">replay</span>
         <button id="feedtoggle">LOG »</button>
+        <div id="rungchip"></div>
       </div>
     </div>
     <div id="scorebug"></div>
@@ -22,6 +23,7 @@
       <div id="lightpool"></div>
       <div id="grain"></div>
       <div id="endscreen"></div>
+      <div id="auditcard"></div>
     </div>
     <div id="transport">
       <div class="scrub" id="scrub"></div>
@@ -48,6 +50,29 @@
   fit();
   CosinoRenderer.bindFeedToggle(document.getElementById("feedtoggle"), true);
   // attach happens in static_replay.js once the wasm module loads
+</script>
+<script>
+  // ==== cosino game block (appended; nothing above this line is edited) ====
+  // relayout() publishes the transport band height and a HUD scale on :root.
+  // Every overlay this game adds is anchored bottom: var(--band), so nothing
+  // can be drawn over the transport by construction; --hudscale is what makes
+  // the 360px featured-match iframe legible.
+  function relayout() {
+    var transport = document.getElementById("transport");
+    var stage = document.getElementById("stage");
+    var band = transport ? transport.offsetHeight : 0;
+    var width = stage && stage.clientWidth ? stage.clientWidth :
+      window.innerWidth;
+    var root = document.documentElement;
+    root.style.setProperty("--band", band + "px");
+    root.style.setProperty("--hudscale",
+      String(Math.max(0.72, Math.min(width / 960, 1))));
+    fit();
+  }
+  // On load, on resize, and on every feed toggle (which dispatches resize).
+  window.addEventListener("load", relayout);
+  window.addEventListener("resize", relayout);
+  relayout();
 </script>
 </body>
 </html>

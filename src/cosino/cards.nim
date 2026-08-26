@@ -202,3 +202,23 @@ proc describeRank*(packed: int): string =
     "two pair, " & rankName(nibble(0)) & " and " & rankName(nibble(1))
   of HandPair: "a pair of " & rankName(nibble(0))
   else: highName(nibble(0)) & " high"
+
+# ---- Calibration-rung decks -------------------------------------------------
+
+proc kuhnDeck*(): seq[int] =
+  ## OpenSpiel `kuhn_poker`: three cards, J-Q-K of spades.
+  @[39, 43, 47]
+
+proc leducDeck*(): seq[int] =
+  ## OpenSpiel `leduc_poker`: J, Q, K in two suits (spades and hearts).
+  @[39, 43, 47, 38, 42, 46]
+
+proc leducRank*(private: int, board: int): int =
+  ## Leduc showdown strength. A private card matching the board's rank is a
+  ## PAIR and beats any unpaired hand; between unpaired hands the higher rank
+  ## wins; equal values split. `board` < 0 means the board card is not out.
+  let own = private.rank
+  if board >= 0 and board.rank == own:
+    2000 + own
+  else:
+    1000 + own

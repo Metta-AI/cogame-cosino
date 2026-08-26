@@ -5,8 +5,9 @@
 // replay (from the game's /replay websocket or the static wasm bundle).
 // All state derivation happens server-side / wasm-side; this file only
 // draws table-state objects:
-//   {seats:[{name,stack,bet,cards,revealed,folded,allIn,out,acting,
-//            handsWon}], board, pot, street, hand, button, handDone}
+//   {seats:[{name,stack,bet,net,cards,revealed,folded,allIn,acting,
+//            handsWon}], board, pot, street, hand, pair, mirror, button,
+//    currentBet, handDone}
 (function () {
   "use strict";
 
@@ -126,7 +127,15 @@
   // it so the whole seat scales as one block.
   var SEAT_BASE = 84;
   var CARD_W = 30, CARD_H = 42;
-  var BUBBLE_MAX_W = 220, BUBBLE_LINES = 4, BUBBLE_LINE_H = 16;
+  // The bubble is sized from the cap the SERVER enforces on a `say`
+  // (MaxSayLen = 120 runes, src/cosino/types.nim), measured in the font the
+  // bubble draws in (13 px 'rajdhani'): the widest 120 runes that cap admits
+  // — every rune a full-width CJK glyph or a playing-card emoji — measure
+  // ~1600 px, and 6 lines x 300 px hold that with the wrap's per-line
+  // remainder to spare. A cut LABEL is a design choice; a cut SENTENCE is a
+  // defect, so a server-capped remark must never reach drawBubble's clip.
+  // Grow these together with MaxSayLen, never one without the other.
+  var BUBBLE_MAX_W = 300, BUBBLE_LINES = 6, BUBBLE_LINE_H = 16;
   var BUBBLE_PAD = 8, BUBBLE_TAIL = 8, BUBBLE_RISE = 0.69;
 
   function bubbleHeight(lines) {
@@ -276,10 +285,14 @@
     var cw = CARD_W * layout.scale * 1.25;
     var chh = CARD_H * layout.scale * 1.25;
     var gap = 6 * layout.scale;
-    var startX = layout.cx - (5 * cw + 4 * gap) / 2 + cw / 2;
+    // The empty board outlines shrink to the variant's board size: Kuhn has
+    // no board at all, Leduc turns one card, Hold'em runs five.
+    var boardSlots = view.boardSlots == null ? 5 : view.boardSlots;
+    var startX = layout.cx - (boardSlots * cw + (boardSlots - 1) * gap) / 2 +
+      cw / 2;
     var highlight = view.highlight || {};
     var highlighting = Object.keys(highlight).length > 0;
-    for (var slot = 0; slot < 5; slot++) {
+    for (var slot = 0; slot < boardSlots; slot++) {
       var cardX = startX + slot * (cw + gap);
       if (slot < board.length) {
         var lit = !!highlight[board[slot]];
@@ -308,6 +321,7 @@
       ctx.save();
       ctx.translate(pos.x, pos.y);
       if (seat.out) {
+        // Busted out of the chip race: a toppled ghost of a cog.
         ctx.globalAlpha = 0.28;
         ctx.rotate(Math.PI / 2);
       } else if (seat.folded) {
@@ -367,25 +381,29 @@
         pos.y + size * 0.62 + 14 * scale);
       ctx.font = "700 " + Math.round(14 * scale) +
         "px 'rajdhani', system-ui, sans-serif";
-      ctx.fillStyle = seat.out ? GHOST : AMBER;
+      ctx.fillStyle = (seat.out || seat.stack === 0) ? GHOST : AMBER;
+      // On the ladder stacks reset every hand, so an empty stack is a
+      // stack-off; on the chip race it is a bust and the seat is out.
       var stackText = seat.out ? "BUST" : "" + seat.stack;
       if (seat.allIn && !seat.out) stackText = "ALL-IN";
       ctx.fillText(stackText, pos.x, pos.y + size * 0.62 + 30 * scale);
       ctx.restore();
 
-      // Hole cards, between the cog and the felt.
+      // Hole cards, between the cog and the felt. Kuhn and Leduc deal one.
       var cards = seat.cards || [];
+      var holeCount = view.holeCount == null ? 2 : view.holeCount;
       var hasCards = !seat.out && !seat.folded &&
         (cards.length > 0 || view.handLive);
       if (hasCards) {
         var spot = alongCenter(pos, layout, size * 1.3);
         var hw = CARD_W * scale;
         var hh = CARD_H * scale;
-        var faceUp = cards.length === 2 &&
+        var faceUp = cards.length === holeCount &&
           (view.showAllCards || seat.revealed || seat.own);
-        for (var c = 0; c < 2; c++) {
-          var offset = (c === 0 ? -1 : 1) * (hw * 0.55 + 1);
-          var tilt = (c === 0 ? -1 : 1) * 0.06;
+        for (var c = 0; c < holeCount; c++) {
+          var offset = holeCount === 1 ? 0 :
+            (c === 0 ? -1 : 1) * (hw * 0.55 + 1);
+          var tilt = holeCount === 1 ? 0 : (c === 0 ? -1 : 1) * 0.06;
           if (faceUp) {
             drawCardFace(ctx, spot.x + offset, spot.y, hw, hh, cards[c],
               1, tilt, !!(view.highlight || {})[cards[c]]);
@@ -603,18 +621,27 @@
     roundRect(ctx, -cw / 2, -chh / 2, cw, chh, cw * 0.13);
     ctx.fill();
     ctx.stroke();
-    ctx.shadowBlur = 0;
+    ctx.restore();
+
+    // The rank and suit are drawn in ABSOLUTE canvas coordinates, outside the
+    // card's translate/rotate. A string laid out relative to a transform is
+    // invisible to any bounds check -- viewer_smoke.mjs --strict-text-bounds
+    // reads the fillText arguments, and every glyph would report at a
+    // negative coordinate whatever was actually on screen. The tilt is worth
+    // less than the gate.
+    ctx.save();
+    ctx.globalAlpha = alpha == null ? 1 : alpha;
     ctx.fillStyle = suitColor(card);
     ctx.textAlign = "center";
+    ctx.textBaseline = "alphabetic";
     var label = cardLabel(card);
     // "10" is two glyphs where every other rank is one; shrink it a notch
     // so it stays inside the card frame.
     ctx.font = "700 " + Math.round(chh * (label.length > 1 ? 0.32 : 0.38)) +
       "px 'rajdhani', system-ui, sans-serif";
-    ctx.textBaseline = "alphabetic";
-    ctx.fillText(label, 0, -chh * 0.08);
+    ctx.fillText(label, x, y - chh * 0.08);
     ctx.font = Math.round(chh * 0.4) + "px system-ui, sans-serif";
-    ctx.fillText(suitGlyph(card), 0, chh * 0.34);
+    ctx.fillText(suitGlyph(card), x, y + chh * 0.34);
     ctx.restore();
   }
 
@@ -639,25 +666,53 @@
     ctx.restore();
   }
 
+  // Wraps a remark to `maxWidth` on whitespace, and splits a single word that
+  // is wider than a whole line on RUNE (code point) boundaries. Whitespace
+  // alone is not enough: Chinese, Japanese and a wall of emoji carry no
+  // spaces at all, and a whitespace-only wrap draws them as one line running
+  // off the canvas.
+  function wrapBubble(ctx, text, maxWidth) {
+    var lines = [];
+    var line = "";
+    function flush() {
+      if (line !== "") {
+        lines.push(line);
+        line = "";
+      }
+    }
+    text.split(/\s+/).forEach(function (word) {
+      if (word === "") return;
+      var probe = line ? line + " " + word : word;
+      if (ctx.measureText(probe).width <= maxWidth) {
+        line = probe;
+        return;
+      }
+      flush();
+      if (ctx.measureText(word).width <= maxWidth) {
+        line = word;
+        return;
+      }
+      Array.from(word).forEach(function (rune) {
+        if (line !== "" && ctx.measureText(line + rune).width > maxWidth) {
+          flush();
+        }
+        line += rune;
+      });
+    });
+    flush();
+    return lines;
+  }
+
   function drawBubble(ctx, canvasWidth, x, y, text, alpha, scale) {
     var s = scale || 1;
     ctx.save();
     ctx.globalAlpha = alpha;
     ctx.font = Math.round(13 * s) + "px 'rajdhani', system-ui, sans-serif";
-    var maxWidth = BUBBLE_MAX_W * s;
-    var words = text.split(/\s+/);
-    var lines = [];
-    var line = "";
-    words.forEach(function (word) {
-      var probe = line ? line + " " + word : word;
-      if (ctx.measureText(probe).width > maxWidth && line) {
-        lines.push(line);
-        line = word;
-      } else {
-        line = probe;
-      }
-    });
-    if (line) lines.push(line);
+    // Never wider than the canvas: the box is clamped into frame below, and a
+    // box wider than the frame would push its own text off the edge.
+    var maxWidth = Math.min(BUBBLE_MAX_W * s,
+      canvasWidth - 12 - BUBBLE_PAD * 2 * s);
+    var lines = wrapBubble(ctx, text, maxWidth);
     var overflow = lines.length > BUBBLE_LINES;
     lines = lines.slice(0, BUBBLE_LINES);
     if (overflow && lines.length) {
@@ -774,13 +829,16 @@
     }
     switch (event.kind) {
       case "handStart":
-        return "Shuffle up — blinds " + (event.text || "") + ", button " +
-          name(event.seat) + ".";
+        return "Shuffle up — " + (event.text || "") + ", button " +
+          name(event.seat) + "." +
+          (event.mirror ? " Duplicate mirror." : "");
       case "deal":
         return name(event.seat) + " is dealt " + cardsText(event.cards) + ".";
       case "blind":
         return name(event.seat) + " posts the " + event.text + " blind (" +
           event.amount + ")" + (event.allIn ? " — ALL-IN" : "") + ".";
+      case "ante":
+        return name(event.seat) + " antes " + event.amount + ".";
       case "say":
         return name(event.seat) + ": “" + nameMap.text(event.text) + "”";
       case "action":
@@ -806,10 +864,34 @@
         }
         return name(event.seat) + " wins " + event.amount + " (" +
           event.text + " pot).";
+      case "stackOff":
+        return name(event.seat) + " is stacked off — chips reset next hand.";
       case "bust":
-        return name(event.seat) + " is FELTED — out of the game!";
+        return name(event.seat) + " is BUSTED — out of the match.";
       case "handEnd":
         return "Hand complete.";
+      case "handVoid":
+        return "Hand VOIDED at the deadline — every chip refunded, not scored.";
+      case "calib":
+        var calib = event.data || {};
+        return name(event.seat) + " exploitability " +
+          (calib.exploitability == null ? "—" :
+            (+calib.exploitability).toFixed(3)) +
+          " chips/hand (coverage " +
+          (calib.coverage == null ? "—" : (+calib.coverage).toFixed(2)) + ")";
+      case "audit":
+        var flag = event.data || {};
+        var pairText = name(flag.a) + " ↔ " + name(flag.b);
+        var head = flag.flag === "soft-play" ? "SOFT PLAY FLAG" : "DUMP FLAG";
+        if (flag.flag !== "soft-play") pairText = name(flag.a) + " → " + name(flag.b);
+        return head + " — " + pairText + ": " +
+          (+(flag.biasAB || 0)).toFixed(2) +
+          " chips/hand of equity surrender over " + (flag.contested || 0) +
+          " contested hands";
+      case "matchEnd":
+        var meta = event.data || {};
+        return "Match over (" + (meta.reason || "complete") + ") after " +
+          (meta.handsScored || 0) + " scored hands.";
       default: return JSON.stringify(event);
     }
   }
@@ -830,8 +912,11 @@
       // better as the table heard it.)
       if (event.kind === "deal") continue;
       if (event.hand !== lastHand) {
-        html += '<div class="feed-round-head">HAND ' +
-          (event.hand + 1) + "</div>";
+        // The mirror half of a duplicate pair is labelled: spectators get to
+        // see the same deck played from the other side of the table.
+        html += '<div class="feed-round-head">HAND ' + (event.hand + 1) +
+          (event.kind === "handStart" && event.mirror ?
+            " — duplicate mirror of hand " + event.hand : "") + "</div>";
         lastHand = event.hand;
         lastStreet = null;
       }
@@ -841,7 +926,8 @@
         lastStreet = event.street;
       }
       var cls = "feed-line feed-" + event.kind +
-        (event.kind === "bust" ? " feed-rwin" : "") +
+        (event.kind === "stackOff" || event.kind === "bust" ||
+          event.kind === "audit" ? " feed-rwin" : "") +
         (event.kind === "award" && event.text !== "returned" ?
           " feed-score seat" + (event.seat % COLORS.length) : "") +
         (i >= limit ? " feed-future" : "");
@@ -950,25 +1036,95 @@
 
   // ---- Scorebug, header, endscreen ----------------------------------------
 
+  // ==== cosino game block begin (appended chrome; the helpers above and
+  // below are cosino's, unchanged apart from the edits the design names) ====
+  // Nothing declared between these fences may be named like a chrome helper
+  // (see CHROME_ALIASES): a game-block `function markBeat` gets shadowed by
+  // the hoisted alias binding and vanishes silently (tandem, 2026-08-23).
+
+  var RUNG_LABELS = {
+    kuhn: "KUHN",
+    leduc: "LEDUC",
+    "holdem-2": "NLHE HU",
+    holdem: "NLHE 6-MAX"
+  };
+
+  function rungLabel(config) {
+    if (!config) return "";
+    var variant = config.variant || "holdem";
+    if (variant === "holdem") {
+      var seatsLabel = (config.seats || 2) <= 2 ? RUNG_LABELS["holdem-2"] :
+        RUNG_LABELS.holdem;
+      return config.chipRace ? seatsLabel + " · CHIP RACE" : seatsLabel;
+    }
+    return RUNG_LABELS[variant] || variant.toUpperCase();
+  }
+
+  function isFixedLimit(config) {
+    return !!config && (config.variant === "kuhn" || config.variant === "leduc");
+  }
+
+  function boardSlotsFor(config) {
+    if (!config) return 5;
+    if (config.variant === "kuhn") return 0;
+    if (config.variant === "leduc") return 1;
+    return 5;
+  }
+
+  function holeCountFor(config) {
+    return isFixedLimit(config) ? 1 : 2;
+  }
+
+  // Round label for the calibration rungs, street name for Hold'em.
+  function streetLabel(state, config) {
+    if (!state || !state.street) return "";
+    if (state.street === "showdown") return "SHOWDOWN";
+    if (!isFixedLimit(config)) return state.street.toUpperCase();
+    return state.street === "preflop" ? "ROUND 1" : "ROUND 2";
+  }
+
+  // Cumulative net INCLUDING whatever this hand has moved so far: `net` is
+  // the running total before the hand, and every hand starts on the same
+  // stack, so the live delta is stack - startingStack.
+  function liveNet(seat, config) {
+    var base = seat.net || 0;
+    if (!config || config.startingStack == null) return base;
+    return base + ((seat.stack || 0) - config.startingStack);
+  }
+
+  function signed(value) {
+    return (value > 0 ? "+" : value < 0 ? "\u2212" : "") + Math.abs(value);
+  }
+
+  function updateRungChip(element, config) {
+    if (!element) return;
+    var label = rungLabel(config);
+    if (element.textContent !== label) element.textContent = label;
+  }
+
+  // ==== cosino game block end ====
+
   function matchHeader(state, config) {
     var parts = [];
     if (state) {
       parts.push("HAND " + ((state.hand || 0) + 1) +
         (config && config.hands ? " / " + config.hands : ""));
-      if (state.street && state.street !== "showdown") {
-        parts.push(state.street.toUpperCase());
-      } else if (state.street === "showdown") {
-        parts.push("SHOWDOWN");
-      }
+      if (state.mirror) parts.push("MIRROR");
+      var street = streetLabel(state, config);
+      if (street) parts.push(street);
       parts.push("POT " + (state.pot || 0));
     }
     if (config) {
-      parts.push("BLINDS " + config.smallBlind + "/" + config.bigBlind);
+      if (isFixedLimit(config)) {
+        parts.push("ANTE " + config.ante);
+      } else {
+        parts.push("BLINDS " + config.smallBlind + "/" + config.bigBlind);
+      }
     }
     return parts.join(" · ");
   }
 
-  function updateScorebug(container, state, nameMap) {
+  function updateScorebug(container, state, nameMap, config) {
     if (!container || !state || !state.seats) return;
     var html = "";
     state.seats.forEach(function (seat, index) {
@@ -977,15 +1133,23 @@
         pips += '<span class="plate-pip"></span>';
       }
       var plateName = nameMap ? nameMap.seat(index) : seat.name;
+      var race = !!(config && config.chipRace);
+      // The big number is the score axis of this game: SIGNED NET CHIPS on
+      // the ladder, the carried STACK on the chip race -- with the chips in
+      // front this hand alongside it.
       html += '<div class="plate ' + seatColor(index) +
         (seat.out ? " dead" : "") + '">' +
         '<span class="plate-name">' + escapeHtml(clampName(plateName)) +
         "</span>" +
         (state.button === index && !seat.out ?
           '<span class="plate-it">D</span>' : "") +
-        '<span class="plate-score">' + (seat.out ? 0 : seat.stack) +
+        '<span class="plate-score">' +
+        (race ? (seat.out ? 0 : seat.stack) :
+          signed(liveNet(seat, config))) +
         "</span>" +
-        '<span class="plate-label">chips</span>' +
+        '<span class="plate-label">' + (race ? "stack" : "net") +
+        "</span>" +
+        '<span class="plate-front">' + (seat.bet || 0) + "</span>" +
         '<span class="plate-pips">' + pips + "</span>" +
         "</div>";
     });
@@ -1017,39 +1181,101 @@
       var winnerIndex = results.win.indexOf(true);
       if (winnerIndex >= 0) verdictColor = seatColor(winnerIndex);
     }
+    var scored = results.handsScored == null ? (results.handsPlayed || 0) :
+      results.handsScored;
     var html = '<div class="end-panel">' +
-      '<div class="end-title">FINAL — ' +
-      (results.handsPlayed || 0) + " HAND" +
-      ((results.handsPlayed || 0) === 1 ? "" : "S") + "</div>" +
+      '<div class="end-title">FINAL — ' + scored + " HAND" +
+      (scored === 1 ? "" : "S") +
+      (results.reason && results.reason !== "complete" ?
+        " (" + escapeHtml(results.reason.toUpperCase()) + ")" : "") +
+      "</div>" +
       '<div class="end-verdict ' + verdictColor + '">' +
       escapeHtml(winners.join(" & ") || "NOBODY") +
       (winners.length > 1 ? " TAKE THE TABLE</div>" :
         " TAKES THE TABLE</div>") +
       '<div class="end-rows">' +
       '<span class="end-head"></span><span class="end-head"></span>' +
-      '<span class="end-head">chips</span>' +
+      '<span class="end-head">' + (results.chipRace ? "stack" : "net") +
+      "</span>" +
       '<span class="end-head">share</span>' +
       '<span class="end-head">hands won</span>' +
-      '<span class="end-head"></span>';
+      '<span class="end-head">' + (results.chipRace ? "" : "exploit") +
+      "</span>";
     order.forEach(function (i, rank) {
       var winner = results.win && results.win[i];
       var cell = function (value) {
         return '<span class="end-cell' + (winner ? " end-row-winner" : "") +
           '">' + value + "</span>";
       };
+      // Exploitability exists only on the calibration rungs; no exact best
+      // response exists at no-limit scale and nothing here pretends otherwise.
+      var expl = (results.exploitability || [])[i];
       html += '<span class="end-cell rank' +
         (winner ? " end-row-winner" : "") + '">' + (rank + 1) + "</span>" +
         '<span class="end-cell name ' + seatColor(i) +
         (winner ? " end-row-winner" : "") + '">' + escapeHtml(names[i]) +
         "</span>" +
-        cell((results.stacks || [])[i] || 0) +
-        cell(((results.scores || [])[i] || 0).toFixed(2)) +
+        (results.chipRace ? cell((results.stacks || [])[i] || 0) :
+          cell(signed((results.net || [])[i] || 0))) +
+        cell(((results.scores || [])[i] || 0).toFixed(3)) +
         cell((results.handsWon || [])[i] || 0) +
-        cell((results.busted || [])[i] ? "busted" : "");
+        (results.chipRace ?
+          cell((results.busted || [])[i] ? "busted" : "") :
+          cell(expl == null ? "—" : (+expl).toFixed(3)));
     });
-    html += "</div></div>";
+    html += "</div>";
+    var flagged = (results.audit && results.audit.flagged) || [];
+    if (flagged.length) {
+      html += '<div class="end-flags"><div class="end-flags-head">' +
+        "FLAGGED PAIRS</div>";
+      flagged.forEach(function (flag) {
+        html += '<div class="end-flag-row">' +
+          escapeHtml(flag.flag) + " — " +
+          escapeHtml(names[flag.a] || ("Seat " + flag.a)) + " / " +
+          escapeHtml(names[flag.b] || ("Seat " + flag.b)) + " · bias " +
+          (+(flag.biasAB || 0)).toFixed(2) + " over " +
+          (flag.contested || 0) + " contested hands</div>";
+      });
+      html += "</div>";
+    }
+    html += "</div>";
     container.innerHTML = html;
   }
+
+  // ==== cosino game block begin (appended chrome; the helpers above and
+  // below are cosino's, unchanged apart from the edits the design names) ====
+  // The collusion panel: hidden unless the replay carries audit findings.
+  function updateAuditCard(element, results, nameMap) {
+    if (!element) return;
+    var audit = (results && results.audit) || null;
+    var flagged = (audit && audit.flagged) || [];
+    if (!flagged.length) {
+      element.classList.remove("show");
+      element.innerHTML = "";
+      return;
+    }
+    var power = (audit && audit.power) || {};
+    var html = '<div class="audit-head">COLLUSION AUDIT</div>';
+    flagged.forEach(function (flag) {
+      var a = nameMap ? nameMap.seat(flag.a) : "Seat " + flag.a;
+      var b = nameMap ? nameMap.seat(flag.b) : "Seat " + flag.b;
+      html += '<div class="audit-row"><span class="audit-flag">' +
+        escapeHtml(flag.flag) + "</span> " +
+        escapeHtml(clampName(a)) +
+        (flag.flag === "soft-play" ? " ↔ " : " → ") +
+        escapeHtml(clampName(b)) + " · " +
+        (+(flag.biasAB || 0)).toFixed(2) + " bias / " +
+        (flag.contested || 0) + " hands</div>";
+    });
+    html += '<div class="audit-power">' + (power.hands || 0) +
+      " hands · median contested " + (power.contestedMedian || 0) +
+      " · " + (power.equitySamples || 0) + " runouts · reporting only</div>";
+    element.innerHTML = html;
+    element.classList.add("show");
+  }
+
+  // ==== cosino game block end ====
+
 
   function bindFeedToggle(button, startCollapsed) {
     if (!button) return;
@@ -1122,9 +1348,12 @@
                   undefined);
               }
               if (options.clock) {
-                options.clock.textContent = matchHeader(latest, latest);
+                options.clock.textContent =
+                  matchHeader(latest, latest.config);
               }
-              updateScorebug(options.scorebug, latest, nameMap);
+              updateScorebug(options.scorebug, latest, nameMap,
+                latest.config);
+              updateRungChip(options.rungchip, latest.config);
             }
             if (data.type === "final") {
               updateEndscreen(options.endscreen, data, true, nameMap);
@@ -1154,7 +1383,9 @@
             // view and sees every hole card. A player page sees only its
             // own seat's (the rest arrive redacted anyway).
             showAllCards: !!latest.policyNames,
-            done: latest.done
+            done: latest.done,
+            boardSlots: boardSlotsFor(latest.config),
+            holeCount: holeCountFor(latest.config)
           });
           if (slot >= 0 && view.seats[slot]) view.seats[slot].own = true;
           renderer.draw(view);
@@ -1164,8 +1395,72 @@
     });
   }
 
-  // Scrubber: a click/drag-to-seek track with one span per hand, a marker
-  // per pot award (colored by the winner) and per bust (taller).
+  // ==== cosino game block begin (appended chrome; the helpers above and
+  // below are cosino's, unchanged apart from the edits the design names) ====
+  // Every kind emitted here has a matching CSS rule in the appended block of
+  // chrome.css, and ci.yml greps for that pairing.
+  var BEAT_KINDS = ["award", "showdown", "stackoff", "bust", "mirror",
+    "void", "audit"];
+
+  function beatKindOf(event) {
+    switch (event.kind) {
+      case "award": return event.text === "returned" ? null : "award";
+      case "reveal": return "showdown";
+      case "stackOff": return "stackoff";
+      case "bust": return "bust";
+      case "handStart": return event.mirror ? "mirror" : null;
+      case "handVoid": return "void";
+      case "audit": return "audit";
+      default: return null;
+    }
+  }
+
+  function beatLabelOf(event, kind) {
+    switch (kind) {
+      case "award": return "Hand " + (event.hand + 1) + ": pot of " +
+        event.amount + " awarded";
+      case "showdown": return "Hand " + (event.hand + 1) + ": showdown — " +
+        (event.text || "reveal");
+      case "stackoff": return "Hand " + (event.hand + 1) + ": seat stacked off";
+      case "bust": return "Hand " + (event.hand + 1) + ": seat busted out";
+      case "mirror": return "Hand " + (event.hand + 1) +
+        ": duplicate mirror deal";
+      case "void": return "Hand " + (event.hand + 1) +
+        ": voided at the deadline";
+      case "audit": return "Collusion flag: " +
+        ((event.data && event.data.flag) || "audit");
+      default: return "beat";
+    }
+  }
+
+  // Clickable, labelled <button>s -- a scrubber beat you cannot seek to is
+  // decoration, and an unlabelled one is invisible to a screen reader.
+  function buildCosinoBeats(container, events, onSeek) {
+    events.forEach(function (event, i) {
+      var kind = beatKindOf(event);
+      if (!kind) return;
+      var marker = document.createElement("button");
+      marker.type = "button";
+      var seat = typeof event.seat === "number" && event.seat >= 0 ?
+        event.seat : 0;
+      marker.className = "beat-marker " + kind + " seat" +
+        (seat % COLORS.length);
+      var label = beatLabelOf(event, kind);
+      marker.setAttribute("aria-label", label);
+      marker.title = label;
+      marker.style.left = ((i + 1) / events.length * 100) + "%";
+      marker.onclick = function (evt) {
+        evt.stopPropagation();
+        onSeek(i + 1);
+      };
+      container.appendChild(marker);
+    });
+  }
+
+  // ==== cosino game block end ====
+
+  // Scrubber: a click/drag-to-seek track with one span per hand plus the
+  // clickable beat markers above.
   function buildScrub(container, events, onSeek) {
     container.innerHTML = "";
     var track = document.createElement("div");
@@ -1193,16 +1488,7 @@
         container.appendChild(sep);
       }
     });
-    events.forEach(function (event, i) {
-      var kind = event.kind;
-      var isWin = kind === "award" && event.text !== "returned";
-      if (!isWin && kind !== "bust") return;
-      var marker = document.createElement("div");
-      marker.className = "beat-marker seat" + (event.seat % COLORS.length) +
-        (kind === "bust" ? " death" : "");
-      marker.style.left = ((i + 1) / events.length * 100) + "%";
-      container.appendChild(marker);
-    });
+    buildCosinoBeats(container, events, onSeek);
     var head = document.createElement("div");
     head.className = "scrub-head";
     container.appendChild(head);
@@ -1239,7 +1525,8 @@
 
   function attachReplay(options) {
     // options: {canvas, feed, scrub, playButton, label, clock, scorebug,
-    //           endscreen, assetBase, payload}
+    //           endscreen, rungchip, auditcard, assetBase, payload,
+    //           onFirstFrame}
     var payload = options.payload;
     var events = payload.events || [];
     var states = payload.states || [];
@@ -1247,6 +1534,7 @@
     var index = 0;
     var playing = true;
     var lastStep = 0;
+    var drawnOnce = false;
 
     makeRenderer(options.canvas, options.assetBase, function (renderer) {
       var effects = makeEffects();
@@ -1281,10 +1569,15 @@
           options.clock.textContent =
             matchHeader(currentState(), payload.config);
         }
-        updateScorebug(options.scorebug, currentState(), nameMap);
+        updateScorebug(options.scorebug, currentState(), nameMap,
+          payload.config);
+        // Called on EVERY index change, so any scrub away from the end
+        // dismisses the endcard.
         updateEndscreen(options.endscreen, payload.results,
           index >= events.length && events.length > 0, nameMap);
       }
+      updateRungChip(options.rungchip, payload.config);
+      updateAuditCard(options.auditcard, payload.results, nameMap);
       setIndex(0, true);
 
       (function frame(timestamp) {
@@ -1308,20 +1601,40 @@
         }
         var view = stateToView(currentState(), nameMap, effects, {
           showAllCards: true,
-          done: index >= events.length && events.length > 0
+          done: index >= events.length && events.length > 0,
+          boardSlots: boardSlotsFor(payload.config),
+          holeCount: holeCountFor(payload.config)
         });
         renderer.draw(view);
+        if (!drawnOnce) {
+          drawnOnce = true;
+          // The attribute goes up on the FIRST DRAWN FRAME, and the host
+          // bridge fires from the same callback -- so "ready" can never
+          // disagree with data-replay-loaded (chorus 3c11c953, 2026-08-24).
+          document.documentElement.setAttribute("data-replay-loaded", "true");
+          if (options.onFirstFrame) {
+            try { options.onFirstFrame(); } catch (ignore) {}
+          }
+        }
         requestAnimationFrame(frame);
       })(0);
-
-      document.documentElement.setAttribute("data-replay-loaded", "true");
     });
   }
+
+  // Chrome helpers the game block must never shadow. ci.yml greps this list
+  // against every function declared below the game-block marker.
+  var CHROME_ALIASES = ["attachLive", "attachReplay", "renderFeed",
+    "bindFeedToggle", "buildScrub", "updateScorebug", "updateEndscreen",
+    "makeNameMap", "makeRenderer", "makeEffects", "matchHeader", "markBeat",
+    "draw", "stateToView"];
 
   window.CosinoRenderer = {
     attachLive: attachLive,
     attachReplay: attachReplay,
     renderFeed: renderFeed,
-    bindFeedToggle: bindFeedToggle
+    bindFeedToggle: bindFeedToggle,
+    buildCosinoBeats: buildCosinoBeats,
+    beatKinds: BEAT_KINDS,
+    chromeAliases: CHROME_ALIASES
   };
 })();

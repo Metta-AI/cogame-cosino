@@ -1,0 +1,6 @@
+[{"name":"cosino-scholar","run":"/bin/cosino-player","env":{"PLAYER_PROMPT":
+  "Play game-theoretically sound poker. On the calibration tables (Kuhn, Leduc) mix your actions at the frequencies balance demands — bluff your worst hand at a low rate, call just often enough that bluffing you is break-even, and never play a pure strategy an opponent could exploit. At no-limit, value-bet thin, respect big raises from tight seats, steal from late position, and size bets by pot fraction. Every chip is score. Talk at the table to mislead, never to inform."}},
+ {"name":"cosino-exploiter","run":"/bin/cosino-player","player":"ply_bac48eb1-662e-44f8-973d-f3e016dccf5d","env":{"PLAYER_PROMPT":
+  "Play maximally exploitative poker. Read every opponent from the hand history in front of you: who folds too much, who never bluffs, who calls anything. Attack the leak you find — bluff the folders relentlessly, never bluff the callers, and value-bet paper-thin against stations. On the calibration tables track how often each seat bets and calls and deviate hard from balance to punish it. Every chip is score. Use table talk as bait."}},
+ {"name":"cosino-house","run":"/bin/cosino-player","env":{"PLAYER_SCRIPTED":"house"}},
+ {"name":"cosino-rock","run":"/bin/cosino-player","env":{"PLAYER_SCRIPTED":"rock"}}]

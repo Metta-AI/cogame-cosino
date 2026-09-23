@@ -98,15 +98,20 @@ proc bedrockUrl(client: LlmClient): string =
   client.bedrockEndpoint & "/model/" &
     client.bedrockModels[client.bedrockModel] & "/invoke"
 
-proc newLlmClient*(config: GameConfig): LlmClient =
+proc newScriptedClient*(config: GameConfig): LlmClient =
   result = LlmClient(
     model: config.model,
     maxOutputTokens: config.maxOutputTokens,
     timeoutSeconds: config.llmTimeoutSeconds,
+    disabled: true,
     spacingMs: DecisionSpacingMs,
     lastCall: getMonoTime(),
     rand: initRand(int64(config.seed) xor 0x5EED)
   )
+
+proc newLlmClient*(config: GameConfig): LlmClient =
+  result = newScriptedClient(config)
+  result.disabled = false
   let bedrockEndpoint = getEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME").strip()
   let bedrockToken = getEnv("AWS_BEARER_TOKEN_BEDROCK").strip()
   if bedrockEndpoint.len > 0 or bedrockToken.len > 0:

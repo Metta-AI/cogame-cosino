@@ -33,3 +33,23 @@ Qwen2.5-0.5B-Instruct tokenizer in 4,096 tokens; the maximum was 1,060 tokens.
 One CPU optimizer step per table with a local tiny model verifies the Metta
 post-training path. These examples distill the scripted teacher; they do not
 establish stronger league play.
+
+# Numeric reinforcement learning
+
+Compile the persistent bridge and pass its binary, manifest, and variant to
+Metta's `recipes.external.coworld.train` (native PufferLib) or
+`recipes.external.coworld_metta_rl.train` (Metta RL):
+
+```sh
+nimby sync nimby.lock
+nim c -d:release --path:src -o:/tmp/cosino-train-bridge tools/train_bridge.nim
+python3 tools/test_train_bridge.py /tmp/cosino-train-bridge
+```
+
+All six certified tables expose 200 numeric observations and seven fixed
+action slots. Illegal or duplicate choices are masked. The action slots cover
+fold, check, call, minimum wager, half-pot wager, pot wager, and all-in.
+The native house player supplies legal teacher actions, projected onto the
+nearest wager slot. The observation includes private cards only for the
+acting seat. Opponent cards enter the structured view only after a public
+reveal. The bridge plays complete matches with the native parser and simulator.

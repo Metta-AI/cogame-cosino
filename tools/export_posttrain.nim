@@ -42,7 +42,7 @@ when isMainModule:
     runtimeConfig["seed"] = %seed
     config.update($runtimeConfig)
     config = sampleEpisode(config)
-    let client = newLlmClient(config)
+    let client = newScriptedClient(config)
     var match = initMatch(config)
     var rows: seq[string]
     var decisions = 0

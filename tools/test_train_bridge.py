@@ -7,7 +7,17 @@ import sys
 from pathlib import Path
 
 
-def play(binary: Path, manifest: Path, variant: str, players: int, teacher: bool) -> None:
+def play(
+    binary: Path,
+    manifest: Path,
+    variant: str,
+    players: int,
+    teacher: bool,
+    *,
+    seed: str | None = None,
+    rng_seed: int = 17,
+    learner_only: bool = False,
+) -> None:
     process = subprocess.Popen(
         [str(binary), str(manifest), variant],
         stdin=subprocess.PIPE,
@@ -16,7 +26,7 @@ def play(binary: Path, manifest: Path, variant: str, players: int, teacher: bool
         bufsize=1,
     )
     assert process.stdin is not None and process.stdout is not None
-    rng = random.Random(17)
+    rng = random.Random(rng_seed)
 
     def request(payload: dict) -> dict:
         process.stdin.write(json.dumps(payload) + "\n")
@@ -24,7 +34,7 @@ def play(binary: Path, manifest: Path, variant: str, players: int, teacher: bool
         return json.loads(process.stdout.readline())
 
     try:
-        observation = request({"kind": "reset", "seed": f"cosino-{variant}-{teacher}", "players": players})
+        observation = request({"kind": "reset", "seed": seed or f"cosino-{variant}-{teacher}", "players": players})
         widths = set()
         decisions = 0
         while observation["kind"] == "decision":
@@ -39,7 +49,7 @@ def play(binary: Path, manifest: Path, variant: str, players: int, teacher: bool
             assert observation["action_schema"]["enum"] == legal
             assert len(view["seats"]) == players
             assert all(not player["revealed_cards"] for player in view["seats"] if not player["revealed"])
-            if teacher:
+            if teacher or (learner_only and observation["seat"] != 0):
                 action = json.loads(request({"kind": "teacher"})["response"])
                 assert action in legal
             else:
@@ -69,3 +79,5 @@ if __name__ == "__main__":
     for variant in ("kuhn", "leduc", "holdem-hu", "holdem-6max", "headsup", "sixmax"):
         for teacher in (True, False):
             play(binary, manifest, variant, 6 if "6max" in variant or variant == "sixmax" else 2, teacher)
+    # A short-stack chip race can auto-settle a hand on blinds before another decision.
+    play(binary, manifest, "headsup", 2, False, seed="stress-137", rng_seed=137 * 177 + 91, learner_only=True)

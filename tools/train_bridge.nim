@@ -187,8 +187,11 @@ when isMainModule:
       match.sim.applyAction(seat, parsed.action)
       if match.sim.done:
         match.finishHand()
-        if not match.done:
+        while not match.done:
           match.nextHand()
+          if not match.sim.done:
+            break
+          match.finishHand()
       inc id
       var observation: JsonNode
       if match.done:

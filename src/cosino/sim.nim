@@ -257,6 +257,24 @@ proc canBet*(sim: Sim, seat: int): bool =
   sim.currentBet == 0 and not sim.wagerCapReached() and
     sim.maxRaiseTo(seat) > 0
 
+proc actionSpaceJson*(sim: Sim, seat: int): JsonNode =
+  ## Legal action kinds and complete amount ranges for the acting seat.
+  ## Policy-side candidate generation may sample these ranges as it likes.
+  result = newJArray()
+  result.add(%*{"kind": "fold"})
+  if sim.callAmount(seat) == 0:
+    result.add(%*{"kind": "check"})
+  else:
+    result.add(%*{"kind": "call", "cost": sim.callAmount(seat)})
+  if sim.canBet(seat):
+    result.add(%*{"kind": "bet", "min": sim.minBet(seat),
+      "max": (if sim.config.variant.fixedLimit:
+        sim.minBet(seat) else: sim.maxRaiseTo(seat))})
+  elif sim.canRaise(seat):
+    result.add(%*{"kind": "raise", "min": sim.minRaiseTo(seat),
+      "max": (if sim.config.variant.fixedLimit:
+        sim.minRaiseTo(seat) else: sim.maxRaiseTo(seat))})
+
 proc oddChipFirst*(sim: Sim): int =
   ## Where an odd chip goes: position 0 (the button) on the calibration rungs,
   ## clockwise from the button's left at Hold'em.

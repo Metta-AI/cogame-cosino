@@ -96,6 +96,21 @@ suite "blinds and order":
       check seat.name.runeLen <= MaxAliasLen
 
 suite "betting":
+  test "action space exposes fixed wagers and complete no-limit bounds":
+    var leduc = fixtureConfig(vLeduc, 2).freshHand()
+    let opening = leduc.actionSpaceJson(leduc.actingSeat)
+    check opening.anyIt(it["kind"].getStr() == "bet" and
+      it["min"].getInt() == 2 and it["max"].getInt() == 2)
+    leduc.act(akBet, 0)
+    let facing = leduc.actionSpaceJson(leduc.actingSeat)
+    check facing.anyIt(it["kind"].getStr() == "raise" and
+      it["min"].getInt() == 4 and it["max"].getInt() == 4)
+
+    let holdem = fixtureConfig(vHoldem, 2).freshHand()
+    let noLimit = holdem.actionSpaceJson(holdem.actingSeat)
+    check noLimit.anyIt(it["kind"].getStr() == "raise" and
+      it["min"].getInt() == 4 and it["max"].getInt() == 100)
+
   test "folding to the big blind pays it the small blind":
     var sim = fixtureConfig(vHoldem, 3).freshHand()
     sim.act(akFold)          # UTG (button 0 -> sb 1, bb 2, utg 0)

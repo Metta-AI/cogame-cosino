@@ -1,9 +1,7 @@
-## Cosino player: a policy is just a prompt.
+## Cosino player: prompt, scripted baseline, or external Jev policy.
 ##
-## Connects to the game, delivers its prompt (from PLAYER_PROMPT, or a default
-## poker personality), then idles until the final frame. All of the actual
-## decision making happens inside the game server, which sends this seat's
-## prompt to Claude on every decision.
+## PLAYER_JEV=1 ranks candidate actions in this container. The game supplies
+## the seat's private observation and complete legal action bounds.
 ##
 ## PLAYER_SCRIPTED=house|rock registers the seat as one of the two built-in
 ## baselines instead: the server plays it deterministically, no LLM. Any other
@@ -15,6 +13,7 @@
 
 import
   std/[json, options, os, strutils],
+  cosino/jev_policy,
   whisky
 
 const DefaultPrompt = """
@@ -30,11 +29,14 @@ when isMainModule:
   let url = getEnv("COWORLD_PLAYER_WS_URL")
   if url.len == 0:
     quit("COWORLD_PLAYER_WS_URL is not set", 1)
+  let jev = getEnv("PLAYER_JEV").strip().toLowerAscii() in ["1", "true", "yes"]
   var prompt = getEnv("PLAYER_PROMPT")
-  if prompt.len == 0:
+  if prompt.len == 0 and not jev:
     prompt = DefaultPrompt
   let scriptedEnv = getEnv("PLAYER_SCRIPTED").strip()
   let scripted = scriptedEnv.len > 0 and scriptedEnv notin ["0", "false", "no"]
+  if jev and scripted:
+    quit("PLAYER_JEV and PLAYER_SCRIPTED cannot both be set", 1)
   let baseline =
     if scriptedEnv.toLowerAscii() == "rock": "rock" else: "house"
 
@@ -44,9 +46,13 @@ when isMainModule:
 
   echo "cosino player: connecting to game"
   let socket = newWebSocket(url)
-  socket.send(promptFrame())
-  echo "cosino player: prompt delivered (", prompt.len, " chars",
-    (if scripted: ", scripted " & baseline else: ""), ")"
+  if jev:
+    socket.send($ %*{"type": "register", "control": "external"})
+    echo "cosino player: Jev external policy registered"
+  else:
+    socket.send(promptFrame())
+    echo "cosino player: prompt delivered (", prompt.len, " chars",
+      (if scripted: ", scripted " & baseline else: ""), ")"
 
   # whisky's receiveMessage RAISES on a close frame or a truncated read (only a
   # timeout returns none), and mummy's send only QUEUES - so the game's own
@@ -71,7 +77,17 @@ when isMainModule:
             " at the ", payload{"variant"}.getStr(), " table"
           ## Re-deliver the prompt after the welcome, in case the first send
           ## raced the server's slot registration.
-          socket.send(promptFrame())
+          if jev:
+            socket.send($ %*{"type": "register", "control": "external"})
+          else:
+            socket.send(promptFrame())
+        of "observation":
+          if jev:
+            let action = chooseAction(payload["observation"], prompt)
+            socket.send($ %*{
+              "type": "action", "id": payload["id"],
+              "kind": action["kind"],
+              "amount": action{"amount"}.getInt(0), "say": ""})
         of "final":
           echo "cosino player: final scores ", payload{"scores"},
             " reason ", payload{"reason"}

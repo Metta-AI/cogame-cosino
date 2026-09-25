@@ -59,7 +59,7 @@ suite "protocols and docs":
       check node.kind == JObject
       check node["type"].getStr() == "text"
       check node["value"].getStr().len > 200
-    check "cosino.player.v1" in game["protocols"]["player"]["value"].getStr()
+    check "cosino.player.v2" in game["protocols"]["player"]["value"].getStr()
     check "PLAYER_PROMPT" in game["protocols"]["player"]["value"].getStr()
     check "PLAYER_SCRIPTED" in game["protocols"]["player"]["value"].getStr()
 

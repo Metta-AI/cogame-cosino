@@ -1,6 +1,6 @@
-## Claude-backed decision making for Cosino. Each seat's policy is just a
-## prompt: the game server composes the table state plus that seat's prompt
-## and asks Claude what the cog says and does with its chips.
+## Claude-backed decisions for prompt policies. The game server composes the
+## table state plus that seat's prompt and asks Claude what the cog says and
+## does with its chips.
 ##
 ## Credentials, in order of preference:
 ##   Bedrock sidecar / bearer token   - hosted pods

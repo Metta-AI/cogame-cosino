@@ -3,21 +3,24 @@
 ## Endpoints:
 ##   GET /healthz                    - liveness
 ##   GET /client/global              - spectator page
-##   GET /client/player              - player page (view-only; policies are prompts)
+##   GET /client/player              - player page (view-only)
 ##   GET /client/replay              - replay page (replay mode)
 ##   GET /client/renderer.js         - shared table renderer
 ##   GET /client/chrome.css          - shared chrome
 ##   GET /client/assets/<name>       - sprites and fonts
-##   WS  /player?slot=N&token=T      - player protocol (prompt delivery)
+##   WS  /player?slot=N&token=T      - cosino.player.v2
 ##   WS  /global                     - spectator snapshots
 ##   WS  /replay                     - replay payload (replay mode)
 ##
-## Player protocol (cosino.player.v1), all JSON text frames:
-##   game -> player: {"type":"welcome","protocol":"cosino.player.v1",...}
+## Player protocol (cosino.player.v2), all JSON text frames:
+##   game -> player: {"type":"welcome","protocol":"cosino.player.v2",...}
 ##                   {"type":"state",...} after every event batch
+##                   {"type":"observation","id":N,"observation":{...}}
 ##                   {"type":"final","done":true,"scores":[...],...}
 ##   player -> game: {"type":"prompt","prompt":"...","scripted":bool,
 ##                    "baseline":"house"|"rock"}   (prompt max 4000 runes)
+##                   {"type":"register","control":"external"}
+##                   {"type":"action","id":N,"kind":str,"amount":N,"say":str}
 
 import
   std/[json, locks, os, sets, strutils, tables, times],
@@ -43,6 +46,12 @@ type
     prompts: seq[string]
     scripted: seq[bool]
     baselines: seq[Baseline]
+    registered: seq[bool]
+    external: seq[bool]
+    decisionId: int
+    pendingSeat: int
+    pendingDecision: Decision
+    pendingAccepted: bool
     fallbacks: seq[int]
     forcedFolds: seq[int]
     decisions: seq[int]
@@ -98,6 +107,7 @@ proc snapshotJson(gs: GameState): JsonNode =
   result["hands"] = %gs.config.hands
   result["handsPlayed"] = %gs.match.handsPlayed
   result["variant"] = %($gs.config.variant)
+  result["chipRace"] = %gs.config.chipRace
   result["startingStack"] = %gs.config.startingStack
   result["ante"] = %gs.config.ante
   result["smallBlind"] = %gs.config.smallBlind
@@ -120,8 +130,31 @@ proc redactCards(snapshot: JsonNode, slot: int) =
       continue
     if kind in ["calib", "audit"]:
       continue
+    if kind == "handStart":
+      event.delete("pair")
+      if event.hasKey("mirror"):
+        event.delete("mirror")
     visible.add(event)
   snapshot["events"] = visible
+  ## Replay configuration contains the seed that determines future decks.
+  snapshot.delete("config")
+  snapshot.delete("pair")
+  snapshot.delete("mirror")
+
+proc playerObservation(gs: GameState, slot: int): JsonNode =
+  result = gs.snapshotJson()
+  result.redactCards(slot)
+  result.delete("policyNames")
+  result["protocol"] = %"cosino.player.v2"
+  result["slot"] = %slot
+  result["rules"] = %(
+    variantRules(gs.config) & "\nCard IDs: rank = ID div 4 (0=deuce to 12=ace), " &
+    "suit = ID mod 4 (clubs, diamonds, hearts, spades).\n" &
+    (if gs.config.chipRace:
+      "Stacks carry between hands; a busted seat is out. Final chip share is the score."
+     else:
+      "Stacks reset each hand. Cumulative net chips determine the score."))
+  result["actionSpace"] = gs.match.sim.actionSpaceJson(slot)
 
 proc broadcastLocked(gs: GameState) =
   ## Callers hold stateLock.
@@ -228,6 +261,8 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var allConnected = false
       withLock stateLock:
         allConnected = state.playerSockets.len >= config.tokens.len
+        for registered in state.registered:
+          allConnected = allConnected and registered
       if allConnected:
         break
       sleep(200)
@@ -267,6 +302,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var seatPrompt: string
       var seatScripted: bool
       var seatBaseline: Baseline
+      var external: bool
       var header: string
       var stopNow = false
       withLock stateLock:
@@ -292,14 +328,48 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             seatPrompt = state.prompts[seat]
             seatScripted = state.scripted[seat]
             seatBaseline = state.baselines[seat]
+            external = state.external[seat]
             header = matchHeader()
       if stopNow:
         break
 
-      ## The slow part (Claude) runs outside the lock on a snapshot; only this
-      ## thread mutates the match, so the snapshot cannot go stale.
-      let decision = client.decide(simCopy, seat, seatPrompt,
-        scripted = seatScripted, baseline = seatBaseline, header = header)
+      var decision: Decision
+      if external:
+        var sent = false
+        withLock stateLock:
+          if state.playerSockets.hasKey(seat):
+            inc state.decisionId
+            state.pendingSeat = seat
+            state.pendingAccepted = false
+            state.playerSockets[seat].send($ %*{
+              "type": "observation",
+              "id": state.decisionId,
+              "observation": state.playerObservation(seat)
+            })
+            sent = true
+        let replyDeadline = min(epochTime() + config.llmTimeoutSeconds.float,
+          hardDeadline)
+        var accepted = false
+        while sent and epochTime() < replyDeadline:
+          withLock stateLock:
+            accepted = state.pendingAccepted
+            if accepted:
+              decision = state.pendingDecision
+          if accepted:
+            break
+          sleep(50)
+        withLock stateLock:
+          state.pendingSeat = -1
+          state.pendingAccepted = false
+        if not accepted:
+          decision = client.scriptedAction(simCopy, seat, seatBaseline)
+          decision.fallback = true
+        echo "cosino: external ", (if accepted: "accepted" else: "fallback"),
+          " seat ", seat
+      else:
+        ## Only the game-hosted prompt path calls Claude from this process.
+        decision = client.decide(simCopy, seat, seatPrompt,
+          scripted = seatScripted, baseline = seatBaseline, header = header)
       inc spent
 
       var handEnded = false
@@ -416,7 +486,7 @@ proc playerUpgradeHandler(request: Request) {.gcsafe.} =
         state.playerSockets.len, "/", state.config.tokens.len, ")"
       websocket.send($ %*{
         "type": "welcome",
-        "protocol": "cosino.player.v1",
+        "protocol": "cosino.player.v2",
         "slot": slot,
         "name": state.match.sim.seats[slot].name,
         "variant": $state.config.variant,
@@ -475,8 +545,27 @@ proc websocketHandler(
             state.prompts[slot] = prompt
             state.scripted[slot] = scripted
             state.baselines[slot] = baseline
+            state.registered[slot] = true
+            state.external[slot] = false
           echo "cosino: slot ", slot, " delivered a prompt (", prompt.len,
             " chars", (if scripted: ", scripted " & $baseline else: ""), ")"
+        elif payload{"type"}.getStr() == "register" and
+            payload["control"].getStr() == "external":
+          withLock stateLock:
+            state.registered[slot] = true
+            state.external[slot] = true
+          echo "cosino: slot ", slot, " registered external control"
+        elif payload{"type"}.getStr() == "action":
+          let id = payload["id"].getInt()
+          let kind = parseEnum[ActionKind](payload["kind"].getStr())
+          let amount = payload{"amount"}.getInt(0)
+          let say = truncateRunes(payload{"say"}.getStr().strip(), MaxSayLen)
+          withLock stateLock:
+            if state.external[slot] and state.pendingSeat == slot and
+                state.decisionId == id and not state.pendingAccepted:
+              state.pendingDecision = Decision(
+                say: say, action: PlayerAction(kind: kind, amount: amount))
+              state.pendingAccepted = true
       except CatchableError as error:
         echo "cosino: ignoring bad player frame: ", error.msg
     of ErrorEvent:
@@ -540,6 +629,9 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.prompts = newSeq[string](n)
   state.scripted = newSeq[bool](n)
   state.baselines = newSeq[Baseline](n)
+  state.registered = newSeq[bool](n)
+  state.external = newSeq[bool](n)
+  state.pendingSeat = -1
   state.fallbacks = newSeq[int](n)
   state.forcedFolds = newSeq[int](n)
   state.decisions = newSeq[int](n)

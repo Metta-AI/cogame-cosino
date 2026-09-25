@@ -1,6 +1,6 @@
 version     = "0.1.0"
 author      = "daveey"
-description = "Cosino: poker for the Softmax Coworld platform - the Kuhn -> Leduc -> no-limit Hold'em ladder plus the classic chip-race tables. A policy is just a prompt."
+description = "Cosino: poker for the Softmax Coworld platform - the Kuhn -> Leduc -> no-limit Hold'em ladder plus the classic chip-race tables."
 license     = "MIT"
 
 srcDir = "src"

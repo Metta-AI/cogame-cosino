@@ -11,8 +11,7 @@ Players can register a prompt, a scripted baseline, or an external action
 policy over `cosino.player.v2`. External policies receive their private cards,
 the public table, and complete legal action bounds. They return a kind,
 amount when needed, and optional table talk. The game validates actions and
-owns rules, results, and replay. `PLAYER_JEV=1` ranks candidate actions in the
-player container. Prompt players retain the original game-hosted Claude path.
+owns rules, results, and replay. Prompt players retain the original game-hosted Claude path.
 
 Watch it: <https://softmax.com/cosino>
 
@@ -99,11 +98,8 @@ coworld upload-policy coworld-cosino:latest --name cosino-house \
   --run /bin/cosino-player --secret-env PLAYER_SCRIPTED=house
 ```
 
-Set `PLAYER_JEV=1` to field the external Jev player. Its TypeSafe credential
-or hosted inference sidecar belongs to the player policy. `PLAYER_PROMPT`
-provides optional strategy guidance. Jev samples bet and raise candidates
-from the game's complete legal amount range; the game accepts any legal
-amount from an external policy.
+External policies may select any bet or raise amount in the game's complete
+legal range.
 
 - **`house`** — the exact α = 1/6 Kuhn equilibrium (measured exploitability 0),
   a Leduc rule table, and a Chen-formula no-limit bot. It is also the fallback
@@ -125,14 +121,12 @@ src/cosino/solve.nim        exact best response and exploitability
 src/cosino/audit.nim        equity, surrender, bias, collusion flags
 src/cosino/llm.nim          decisions, prompts, the two scripted baselines
 src/cosino/server.nim       the Coworld game contract
-src/cosino_player.nim       prompt, scripted, and Jev player entrypoint
-src/cosino/jev_policy.nim  Jev request and action candidate ranking
+src/cosino_player.nim       prompt and scripted player entrypoint
 client/                    chrome.css + renderer.js + the three live pages
 replay-viewer/             the static wasm bundle (config.nims, cosino_replay.nim,
                            static_replay.js, index.html)
 tools/build_replay_viewer.sh   the `coworld build` hook (mode 100755)
 tools/ci/                  docker_smoke.sh, viewer_smoke.mjs, policies.json
-                           smoke_jev.py (mixed external action path)
 tests/                     six suites, run twice (debug and -d:release) in CI
 ```
 
@@ -176,9 +170,7 @@ for t in tests/*.nim; do nim r --hints:off --path:src "$t"; done
   then every `tests/*.nim` twice, debug and `-d:release`.
 - **`docker-smoke`** — builds the production image and runs one real episode of
   the certification fixture in raw docker with **no** `ANTHROPIC_API_KEY`, so
-  both seats play scripted. It then seats mock Jev against the house baseline
-  across all six tables, checking private observations, action acceptance,
-  results, and replay. Uploads the normal replay as `smoke-replay`.
+  both seats play scripted. It uploads the normal replay as `smoke-replay`.
 - **`wasm-viewer`** — builds the static bundle and **executes** it in headless
   Chromium three times: against the smoke replay, the committed six-max
   fixture `tools/ci/fixtures/sixmax_audit.replay` (two flagged pairs and a

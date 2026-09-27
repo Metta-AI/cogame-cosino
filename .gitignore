@@ -1,7 +1,6 @@
 bin/
 tmp/
 dist/
-dist-jev/
 replay-viewer/dist/nimcache/
 *.replay
 # The committed fixtures (sixmax_audit, chiprace_bust) are regenerated and diffed by tests/test_sim.nim.

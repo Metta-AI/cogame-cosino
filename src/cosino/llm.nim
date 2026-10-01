@@ -3,7 +3,8 @@
 ## does with its chips.
 ##
 ## Credentials, in order of preference:
-##   Bedrock sidecar / bearer token   - hosted pods
+##   COWORLD_LLM_ENDPOINT            - hosted sidecar
+##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
 ## With no credentials every decision falls back to the always-legal scripted
@@ -36,13 +37,14 @@ type
     error*: string     ## why, rune-truncated for the replay
 
   LlmTransport = enum
-    ltNone, ltBedrock, ltAnthropic
+    ltNone, ltSidecar, ltBedrock, ltAnthropic
 
   LlmClient* = ref object
     curl: Curly
     transport: LlmTransport
     apiKey: string          ## anthropic transport
-    bedrockEndpoint: string ## bedrock transport: sidecar or public host
+    sidecarEndpoint: string
+    bedrockEndpoint: string ## local Bedrock transport
     bedrockModels: seq[string]  ## candidates, tried in order on denial
     bedrockModel: int           ## index into bedrockModels
     bedrockToken: string
@@ -112,6 +114,13 @@ proc newScriptedClient*(config: GameConfig): LlmClient =
 proc newLlmClient*(config: GameConfig): LlmClient =
   result = newScriptedClient(config)
   result.disabled = false
+  let sidecarEndpoint = getEnv("COWORLD_LLM_ENDPOINT").strip()
+  if sidecarEndpoint.len > 0:
+    result.transport = ltSidecar
+    result.sidecarEndpoint = sidecarEndpoint.strip(chars = {'/'}, leading = false)
+    result.model = getEnv("COWORLD_LLM_MODEL", "anthropic/claude-haiku-4.5")
+    result.curl = newCurly()
+    return
   let bedrockEndpoint = getEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME").strip()
   let bedrockToken = getEnv("AWS_BEARER_TOKEN_BEDROCK").strip()
   if bedrockEndpoint.len > 0 or bedrockToken.len > 0:
@@ -634,13 +643,15 @@ proc extractJsonObject*(text: string): JsonNode =
     raise newException(CosinoError, "no JSON object in response")
   parseJson(text[start .. stop])
 
-proc completeText(client: LlmClient, system, user: string): string =
+proc completeText(client: LlmClient, system, user: string, slot: int): string =
   var body = %*{
     "max_tokens": client.maxOutputTokens,
     "system": system,
     "messages": [{"role": "user", "content": user}]
   }
   var headers: HttpHeaders
+  if client.transport == ltSidecar and slot >= 0:
+    headers["X-Coworld-Player-Slot"] = $slot
   headers["content-type"] = "application/json"
   var url: string
   if client.transport == ltBedrock:
@@ -648,6 +659,10 @@ proc completeText(client: LlmClient, system, user: string): string =
     if client.bedrockToken.len > 0:
       headers["authorization"] = "Bearer " & client.bedrockToken
     url = client.bedrockUrl()
+  elif client.transport == ltSidecar:
+    body["model"] = %client.model
+    headers["anthropic-version"] = AnthropicVersion
+    url = client.sidecarEndpoint & "/v1/messages"
   else:
     body["model"] = %client.model
     headers["x-api-key"] = client.apiKey
@@ -777,7 +792,7 @@ proc decide*(
       user.add("\nYour previous reply was invalid. Respond with ONLY the " &
         "requested JSON object and a legal action with a legal amount.")
     try:
-      let payload = extractJsonObject(client.completeText(system, user))
+      let payload = extractJsonObject(client.completeText(system, user, seat))
       return parseDecision(sim, seat, payload)
     except CatchableError as error:
       lastError = error.msg

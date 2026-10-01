@@ -48,8 +48,8 @@ suite "top-level shape":
     check runnable["run"].getElems() == @[%"/bin/cosino"]
     ## The LLM runs GAME-side, so the GAME runnable needs the key (hive,
     ## 2026-08-23), and the namespace is game.name, not the repo slug.
-    check runnable["env"]["ANTHROPIC_API_KEY_URI"].getStr() ==
-      "secret://coworld/" & game["name"].getStr() & "/anthropic_api_key"
+    doAssert runnable{"env"}{"ANTHROPIC_API_KEY_URI"}.isNil,
+      "hosted LLM uses the platform sidecar without provider secrets"
     check game["name"].getStr() == "cosino"
 
 suite "protocols and docs":

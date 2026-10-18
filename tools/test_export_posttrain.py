@@ -32,6 +32,7 @@ if __name__ == "__main__":
                         assert row["outcome"]["reason"] == "complete"
                         assert row["outcome"]["net"] == run["net"] and sum(run["net"]) == 0
                         assert row["outcome"]["hands"] == run["hands"]
+                        assert row["outcome"]["fallbacks"] == row["outcome"]["forced_folds"] == 0
                         scores = [value["score"] for value in row["participant_outcomes"].values()]
                         assert all(0 <= score <= 1 for score in scores) and abs(sum(scores) - 1) < 1e-9
                         families.setdefault(row["seed_family"], set()).add(variant)
@@ -53,7 +54,6 @@ if __name__ == "__main__":
                     assert row["action_status"] == "accepted" and attempt["accepted"]
                     assert row["selected_attempt_id"] == attempt["attempt_id"]
                     assert row["executed_action"] == attempt["parsed_action"]
-                    assert row["execution"]["fallbacks"] == row["execution"]["forced_folds"] == 0
             assert episodes == 10 and decisions == 0
             print(variant, "10 complete private source matches PASS", flush=True)
     assert len(families) == 10 and all(tables == set(VARIANTS) for tables in families.values())

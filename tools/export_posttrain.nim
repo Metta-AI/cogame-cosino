@@ -46,7 +46,7 @@ when isMainModule:
       var match = initMatch(config)
       let family = "cosino-" & $seed
       let episode = family & "-" & variant & "-" & $selection.selectedVariant & "-" & $selection.seed
-      var decisionId = 0
+      var decisionId, fallbacks, forcedFolds: int
       while not match.done:
         let seat = match.sim.actingSeat
         let system = systemPrompt(match.sim, seat, selection)
@@ -61,8 +61,9 @@ when isMainModule:
         if teacher.action.kind in [akBet, akRaise]: proposal["amount"] = %teacher.action.amount
         let parsed = parseDecision(match.sim, seat, proposal)
         let start = match.sim.events.len
-        let hand = match.sim.hand
         let outcome = client.applyDecision(match.sim, seat, parsed)
+        fallbacks += outcome.fallbacks
+        forcedFolds += outcome.forcedFolds
         var executed = %*{"say": parsed.say}
         for index in start ..< match.sim.events.len:
           let event = match.sim.events[index]
@@ -94,8 +95,7 @@ when isMainModule:
           "attempts": [attempt], "selected_attempt_id": (if accepted: %attemptId else: newJNull()),
           "executed_action": executed, "action_status": (if accepted: "accepted" else: "fallback"),
           "fallback_origin": (if accepted: newJNull() else: %"engine-normalized-submission"),
-          "terminal": match.done, "execution": {"hand": hand, "fallbacks": outcome.fallbacks,
-            "forced_folds": outcome.forcedFolds}
+          "terminal": match.done
         }))
         inc decisionId
       doAssert decisionId > 0 and match.reason == erComplete
@@ -110,7 +110,8 @@ when isMainModule:
         "seed_family": family, "game": "cosino", "game_version": "source-" & revision,
         "source_revision": revision, "status": "completed",
         "outcome": {"net": match.net, "hands": match.handsPlayed,
-          "hands_scored": match.handsScored, "reason": "complete"},
+          "hands_scored": match.handsScored, "reason": "complete",
+          "fallbacks": fallbacks, "forced_folds": forcedFolds},
         "participant_outcomes": participants
       }))
       runs.add(%*{"seed": seed, "decisions": decisionId, "hands": match.handsPlayed, "net": match.net})

@@ -29,6 +29,8 @@ import
   mummy,
   mummy/routers,
   llm,
+  prompts,
+  evidence,
   sim
 
 const
@@ -42,6 +44,8 @@ const
 type
   GameState = object
     config: GameConfig
+    selection: PromptSelection
+    tracePath: string
     match: Match
     prompts: seq[string]
     scripted: seq[bool]
@@ -212,6 +216,8 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
     results = state.match.resultsJson(state.fallbacks, state.forcedFolds,
       state.decisions)
     replayData = state.replayPayload(results)
+    if state.tracePath.len > 0:
+      appendPrivate(state.tracePath, %*{"event_type": "episode_end", "results": results})
 
     ## Send final frames to players BEFORE writing artifacts: the hosted
     ## worker tears player pods down as soon as results.json exists, and
@@ -369,15 +375,48 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       else:
         ## Only the game-hosted prompt path calls Claude from this process.
         decision = client.decide(simCopy, seat, seatPrompt,
-          scripted = seatScripted, baseline = seatBaseline, header = header)
+          scripted = seatScripted, selection = state.selection, baseline = seatBaseline, header = header)
       inc spent
 
       var handEnded = false
       withLock stateLock:
         inc state.decisions[seat]
         ## Degrade twice, never hang: illegal -> baseline -> fold.
+        var messages, metadata = newJNull()
+        if state.tracePath.len > 0 and not external and not seatScripted:
+          let system = systemPrompt(simCopy, seat, state.selection)
+          let user = userPrompt(simCopy, seat, seatPrompt, header)
+          messages = %*[{"role": "system", "content": system}, {"role": "user", "content": user}]
+          metadata = state.selection.promptMetadata(system, user)
+        let eventStart = state.match.sim.events.len
         let outcome = client.applyDecision(state.match.sim, seat, decision,
           seatBaseline)
+        if state.tracePath.len > 0:
+          var proposal = %*{"say": decision.say, "action": $decision.action.kind}
+          if decision.action.kind in [akBet, akRaise]: proposal["amount"] = %decision.action.amount
+          var executed = %*{"say": decision.say}
+          for index in eventStart ..< state.match.sim.events.len:
+            let event = state.match.sim.events[index]
+            if event.kind == evAction and event.seat == seat:
+              executed["action"] = %($event.action)
+              if event.action in [akBet, akRaise]: executed["amount"] = %event.amount
+          doAssert executed.hasKey("action")
+          let selected = decision.selectedAttemptId.len > 0 and
+            outcome.fallbacks == 0 and outcome.forcedFolds == 0
+          appendPrivate(state.tracePath, %*{
+            "event_type": "host_decision", "visibility": "private", "decision_index": spent - 1,
+            "seat": seat, "hand": simCopy.hand,
+            "source": (if external: "external" elif seatScripted: "scripted" else: "prompt"),
+            "policy_origin": (if external: "external" elif seatScripted: "scripted"
+              elif decision.attemptIds.len == 0: "scripted-no-inference"
+              elif decision.fallback: "scripted-fallback" else: "model"),
+            "prompt": messages, "prompt_template": metadata,
+            "attempt_ids": decision.attemptIds,
+            "returned_attempt_id": (if decision.selectedAttemptId.len > 0: %decision.selectedAttemptId else: newJNull()),
+            "selected_attempt_id": (if selected: %decision.selectedAttemptId else: newJNull()),
+            "proposal": proposal, "executed_action": executed,
+            "fallbacks": outcome.fallbacks, "forced_folds": outcome.forcedFolds
+          })
         state.fallbacks[seat] += outcome.fallbacks
         state.forcedFolds[seat] += outcome.forcedFolds
         if state.match.sim.done:
@@ -617,10 +656,22 @@ proc runReplayServer*(runtimeConfig: RuntimeConfig) =
   echo "cosino: replay mode on ", runtimeConfig.host, ":", runtimeConfig.port
   gameServer.serve(Port(runtimeConfig.port), runtimeConfig.host)
 
-proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
+proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig, selection: PromptSelection) =
   if config.tokens.len != config.players.len:
     raise newException(CosinoError, "tokens and players must align")
   state.config = config
+  state.selection = selection
+  state.tracePath = getEnv("COSINO_HOST_TRACE_PATH")
+  if state.tracePath.len > 0:
+    let revision = getEnv("COSINO_SOURCE_REVISION")
+    doAssert revision.len > 0, "private capture requires a source revision label"
+    writePrivate(state.tracePath, $(%*{
+      "schema_version": 1, "event_type": "episode_start", "visibility": "private",
+      "source_revision": revision, "seed": config.seed, "variant": $config.variant,
+      "seats": config.players.len, "hands": config.hands, "chip_race": config.chipRace,
+      "turn_delay_ms": config.turnDelayMs, "decision_budget": EpisodeDecisionBudget,
+      "decision_spacing_ms": DecisionSpacingMs, "prompt_selection": selection.selectionMetadata()
+    }) & "\n")
   state.match = initMatch(config)
   ## initMatch settles the seed-derived seating; keep the served config in
   ## step so the replay carries the order the hands were actually dealt with.

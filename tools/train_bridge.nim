@@ -1,8 +1,8 @@
 ## Persistent numeric decision bridge for Metta RL and native PufferLib.
 ## nim c -d:release --path:src -o:cosino-train-bridge tools/train_bridge.nim
 
-import std/[json, os]
-import cosino/[llm, sim]
+import std/[json, os, posix]
+import cosino/[llm, sim, prompts]
 
 const
   OperatorPrompt = "Play to maximize your own score using only your cards and the public table."
@@ -44,7 +44,7 @@ proc choices(sim: Sim, seat: int): JsonNode =
         duplicate = true
     result.add(if duplicate: newJNull() else: candidate)
 
-proc decision(match: Match, seat, id: int): JsonNode =
+proc decision(match: Match, seat, id: int, selection: PromptSelection, textMode: bool): JsonNode =
   let sim = match.sim
   var publicSeats = newJArray()
   for slot, player in sim.seats:
@@ -58,7 +58,7 @@ proc decision(match: Match, seat, id: int): JsonNode =
   for candidate in sim.choices(seat):
     if candidate.kind != JNull:
       legal.add(candidate)
-  %*{
+  result = %*{
     "kind": "decision", "game": "cosino", "decision_id": id,
     "seat": seat, "engine_seat": seat, "turn": match.handsPlayed,
     "semantic_view": {"hand": sim.hand, "hands": match.config.hands,
@@ -68,7 +68,7 @@ proc decision(match: Match, seat, id: int): JsonNode =
       "call_amount": sim.callAmount(seat), "legal_actions": legal},
     "inbox": [],
     "messages": [
-      {"role": "system", "content": systemPrompt(sim, seat)},
+      {"role": "system", "content": systemPrompt(sim, seat, selection)},
       {"role": "user", "content": userPrompt(sim, seat, OperatorPrompt,
         "Hand " & $(sim.hand + 1) & " of " & $match.config.hands &
         " in the match (" & $match.config.variant & ").")}
@@ -77,6 +77,14 @@ proc decision(match: Match, seat, id: int): JsonNode =
     "action_schema": {"type": "object", "enum": legal},
     "typed_question": newJNull()
   }
+
+  if textMode:
+    result["semantic_view"]["legal_actions"] = sim.actionSpaceJson(seat)
+    result["semantic_view"]["prompt_template"] = selection.promptMetadata(
+      result["messages"][0]["content"].getStr(), result["messages"][1]["content"].getStr())
+    result["action_schema"] = %*{"type": "object", "required": ["action"],
+      "properties": {"action": {"type": "string"}, "amount": {"type": "integer"},
+        "say": {"type": "string"}}}
 
 proc encoding(match: Match, seat, id: int, variant: string): JsonNode =
   let sim = match.sim
@@ -127,9 +135,11 @@ proc encoding(match: Match, seat, id: int, variant: string): JsonNode =
 
 when isMainModule:
   let args = commandLineParams()
-  if args.len notin 1 .. 2:
-    quit("usage: cosino-train-bridge MANIFEST [variant]", 1)
-  let variant = if args.len == 2: args[1] else: "kuhn"
+  if args.len notin 1 .. 3:
+    quit("usage: cosino-train-bridge MANIFEST [variant [text]]", 1)
+  let textMode = args.len == 3
+  if textMode: doAssert args[2] == "text"
+  let variant = if args.len >= 2: args[1] else: "kuhn"
   let manifest = parseFile(args[0])
   var variantConfig: JsonNode
   for entry in manifest["variants"]:
@@ -139,12 +149,20 @@ when isMainModule:
   var match: Match
   var client: LlmClient
   var id = 0
+  var selection: PromptSelection
+  let protocolFd = dup(1)
+  doAssert protocolFd >= 0 and dup2(2, 1) >= 0
   while not stdin.endOfFile:
     let request = parseJson(stdin.readLine())
     var response: JsonNode
     case request["kind"].getStr()
     of "reset":
       doAssert request["players"].getInt() == variantConfig["players"].len
+      selection = if textMode: promptSelection(request) else: PromptSelection()
+      let split = if request.hasKey("split"): request["split"].getStr() else: "train"
+      doAssert split in ["train", "validation", "test"]
+      if split == "train" and selection.selectedVariant in {pvHeldoutBriefing, pvHeldoutReference}:
+        raise newException(ValueError, "held-out wording is evaluation-only")
       var config = defaultGameConfig()
       let runtimeConfig = copy(variantConfig)
       runtimeConfig["seed"] = %seedOf(request["seed"].getStr())
@@ -156,35 +174,53 @@ when isMainModule:
       match = initMatch(config)
       client = newScriptedClient(config)
       id = 0
-      response = match.decision(match.sim.actingSeat, id)
+      response = match.decision(match.sim.actingSeat, id, selection, textMode)
     of "encode":
       doAssert not match.done
       response = match.encoding(match.sim.actingSeat, id, variant)
     of "teacher":
       doAssert not match.done
       let seat = match.sim.actingSeat
-      let scripted = client.scriptedAction(match.sim, seat, blHouse).action
-      let available = match.sim.choices(seat)
-      var selected = available[0]
-      var distance = high(int)
-      for candidate in available:
-        if candidate.kind == JNull or candidate["action"].getStr() != $scripted.kind:
-          continue
-        let delta = if scripted.kind in [akBet, akRaise]:
-          abs(candidate["amount"].getInt() - scripted.amount) else: 0
-        if delta < distance:
-          selected = candidate
-          distance = delta
-      doAssert distance < high(int), "scripted action has no legal candidate"
-      response = %*{"response": $selected}
+      let teacher = client.scriptedAction(match.sim, seat, blHouse)
+      let scripted = teacher.action
+      if textMode:
+        var proposal = action(scripted.kind, scripted.amount)
+        proposal["say"] = %teacher.say
+        response = %*{"response": $proposal}
+      else:
+        let available = match.sim.choices(seat)
+        var selected = available[0]
+        var distance = high(int)
+        for candidate in available:
+          if candidate.kind == JNull or candidate["action"].getStr() != $scripted.kind:
+            continue
+          let delta = if scripted.kind in [akBet, akRaise]:
+            abs(candidate["amount"].getInt() - scripted.amount) else: 0
+          if delta < distance:
+            selected = candidate
+            distance = delta
+        doAssert distance < high(int), "scripted action has no legal candidate"
+        response = %*{"response": $selected}
     of "step":
       doAssert not match.done and request["decision_id"].getInt() == id
       let seat = match.sim.actingSeat
-      let chosen = parseJson(request["response"].getStr())
-      doAssert chosen in match.sim.choices(seat)
+      let chosen = extractJsonObject(request["response"].getStr())
+      if not textMode: doAssert chosen in match.sim.choices(seat)
       let parsed = parseDecision(match.sim, seat, chosen)
-      match.sim.recordSay(seat, parsed.say)
-      match.sim.applyAction(seat, parsed.action)
+      var executed = chosen
+      if textMode:
+        let start = match.sim.events.len
+        discard client.applyDecision(match.sim, seat, parsed)
+        executed = %*{"say": parsed.say}
+        for index in start ..< match.sim.events.len:
+          let event = match.sim.events[index]
+          if event.kind == evAction and event.seat == seat:
+            executed["action"] = %($event.action)
+            if event.action in [akBet, akRaise]: executed["amount"] = %event.amount
+        doAssert executed.hasKey("action")
+      else:
+        match.sim.recordSay(seat, parsed.say)
+        match.sim.applyAction(seat, parsed.action)
       if match.sim.done:
         match.finishHand()
         while not match.done:
@@ -204,10 +240,13 @@ when isMainModule:
           scores[$slot] = %share
         observation = %*{"kind": "terminal", "scores": scores}
       else:
-        observation = match.decision(match.sim.actingSeat, id)
-      response = %*{"kind": "accepted", "action": chosen,
+        observation = match.decision(match.sim.actingSeat, id, selection, textMode)
+      response = %*{"kind": "accepted", "action": executed,
         "observation": observation}
     else:
       raise newException(ValueError, "unknown command: " & request["kind"].getStr())
+    stdout.flushFile()
+    doAssert dup2(protocolFd, 1) >= 0
     stdout.writeLine($response)
     stdout.flushFile()
+    doAssert dup2(2, 1) >= 0

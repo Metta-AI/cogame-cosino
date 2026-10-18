@@ -1,3 +1,4 @@
+import cosino/prompts
 ## The scripted baselines are the completion path: they are the
 ## no-credentials fallback (offline certification), the fallback whenever a
 ## model decision fails, AND two fieldable policies. They must be legal at
@@ -80,7 +81,7 @@ suite "degrade, never hang":
     var match = initMatch(config)
     let seat = match.sim.actingSeat
     let started = getMonoTime()
-    let decision = client.decide(match.sim, seat, "raise every hand",
+    let decision = client.decide(match.sim, seat, "raise every hand", selection = PromptSelection(),
       scripted = false)
     let elapsed = (getMonoTime() - started).inMilliseconds
     ## No network wait at all: no retries, no spacing floor, no timeout.

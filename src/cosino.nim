@@ -5,6 +5,7 @@ import
   std/[json, sysrand],
   bitworld/runtime,
   cosino/server,
+  cosino/prompts,
   cosino/sim
 
 proc randomSeed(): int =
@@ -47,4 +48,6 @@ when isMainModule:
       " hands=", config.hands,
       " duplicate=", config.duplicate,
       " model=", config.model
-    runGameServer(config, runtimeConfig)
+    let selection = promptSelection(if runtimeConfig.config.len == 0:
+      newJObject() else: parseJson(runtimeConfig.config))
+    runGameServer(config, runtimeConfig, selection)

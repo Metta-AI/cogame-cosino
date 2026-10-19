@@ -16,9 +16,7 @@ import
   std/[json, math, monotimes, os, random, strutils, times],
   bitworld/runtime,
   curly,
-  sim,
-  prompts,
-  evidence
+  sim, prompts
 
 const
   AnthropicUrl = "https://api.anthropic.com/v1/messages"
@@ -34,8 +32,6 @@ type
 
   Decision* = object
     say*: string
-    attemptIds*: seq[string]
-    selectedAttemptId*: string
     action*: PlayerAction
     fallback*: bool    ## the scripted baseline played instead of the model
     error*: string     ## why, rune-truncated for the replay
@@ -58,7 +54,6 @@ type
     disabled: bool          ## true once credentials are known-unavailable
     spacingMs*: int         ## wall-clock floor between decision starts
     lastCall: MonoTime
-    decisionSequence: int
     rand: Rand
 
 proc parseBaseline*(text: string): Baseline =
@@ -481,23 +476,7 @@ proc systemPrompt*(sim: Sim, seat: int, selection: PromptSelection): string =
   selection.introduction(sim.seatName(seat), variantName(config.variant, sim.seats.len),
     if config.chipRace: "table" else: "ladder") & "\n\n" &
     variantRules(config) & "\n\n" &
-    (if config.chipRace:
-      "- Every seat bought in ONCE for " & $config.startingStack &
-      " chips. Stacks carry from hand to hand,\n" &
-      "  a seat that loses its last chip is OUT for good (no rebuys), and " &
-      "your score is your final\n" &
-      "  CHIP SHARE — so protecting a short stack counts as much as " &
-      "building a tower.\n"
-     else:
-      "- Every hand starts with both/all seats on " & $config.startingStack &
-      " chips. Your score is your\n" &
-      "  cumulative NET chips across the match, so a chip saved counts " &
-      "exactly as much as a chip won.\n") &
-    "- Table talk is public and free. Bluff, needle and mislead — but your " &
-    "cards stay secret until\n  showdown.\n" &
-    "- Pick exactly one action from the legal list you are given, with an " &
-    "amount inside the stated\n  range. An illegal answer is replaced by a " &
-    "house baseline move, which is never what you want.\n\n" &
+    selection.matchBriefing(config.startingStack, config.chipRace) &
     "Reply with a single JSON object and NOTHING else. Your reply MUST " &
     "begin with the character `{`."
 
@@ -646,7 +625,7 @@ proc extractJsonObject*(text: string): JsonNode =
     raise newException(CosinoError, "no JSON object in response")
   parseJson(text[start .. stop])
 
-proc completeText(client: LlmClient, system, user: string, slot: int, record: JsonNode): string =
+proc completeText(client: LlmClient, system, user: string, slot: int): string =
   var body = %*{
     "max_tokens": client.maxOutputTokens,
     "system": system,
@@ -672,15 +651,7 @@ proc completeText(client: LlmClient, system, user: string, slot: int, record: Js
     headers["anthropic-version"] = AnthropicVersion
     url = AnthropicUrl
   ## `output_config.effort` is NOT sent: Haiku 4.5 rejects it.
-  record["request"] = copy(body)
-  record["model"] = %(if client.transport == ltBedrock:
-    client.bedrockModels[client.bedrockModel] else: client.model)
-  let traceDirectory = getEnv("COSINO_ATTEMPT_TRACE_DIR")
-  if traceDirectory.len > 0:
-    writePrivate(traceDirectory / (record["attempt_id"].getStr() & "-start.json"), $record & "\n")
   let response = client.curl.post(url, headers, $body, client.timeoutSeconds)
-  record["raw_response"] = %response.body
-  record["http_status"] = %response.code
   if response.code == 401 or response.code == 403:
     let detail = response.body[0 .. min(response.body.high, 400)]
     if "Model access is denied" in response.body and
@@ -793,59 +764,26 @@ proc decide*(
 ): Decision =
   ## One decision for one seat. Never raises: any failure degrades to the
   ## scripted baseline so the game always advances.
-  inc client.decisionSequence
   if scripted or client.disabled:
     return client.scriptedAction(sim, seat, baseline)
   client.waitForSpacing()
   let system = systemPrompt(sim, seat, selection)
   var lastError = ""
-  var attemptIds: seq[string]
   for attempt in 0 .. 1:
     var user = userPrompt(sim, seat, prompt, header)
     if attempt > 0:
       user.add("\nYour previous reply was invalid. Respond with ONLY the " &
         "requested JSON object and a legal action with a legal amount.")
-    let identity = "decision-" & $client.decisionSequence & "-seat-" & $seat & "-attempt-" & $attempt
-    attemptIds.add(identity)
-    let record = %*{
-      "schema_version": 1, "event_type": "attempt_start", "visibility": "private",
-      "attempt_id": identity, "seat": seat,
-      "prompt": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-      "prompt_template": selection.promptMetadata(system, user),
-      "request": newJNull(), "model": newJNull(), "platform_call_id": newJNull(),
-      "behavior_logprobs": newJNull(), "raw_response": newJNull(), "http_status": newJNull(),
-      "response": newJNull(), "parsed_action": newJNull(), "parsed_proposal": newJNull(),
-      "parse_ok": false, "failure": newJNull()
-    }
-    let started = getMonoTime()
     try:
-      let response = client.completeText(system, user, seat, record)
-      record["response"] = %response
-      let payload = extractJsonObject(response)
-      record["parsed_action"] = copy(payload)
-      result = parseDecision(sim, seat, payload)
-      var proposal = %*{"say": result.say, "action": $result.action.kind}
-      if result.action.kind in [akBet, akRaise]: proposal["amount"] = %result.action.amount
-      record["parsed_proposal"] = proposal
-      record["parse_ok"] = %true
-      result.attemptIds = attemptIds
-      result.selectedAttemptId = identity
-      return
+      let payload = extractJsonObject(client.completeText(system, user, seat))
+      return parseDecision(sim, seat, payload)
     except CatchableError as error:
       lastError = error.msg
-      record["failure"] = %error.msg
       echo "cosino llm: seat ", seat, " attempt ", attempt, " failed: ",
         error.msg
       if client.disabled or "429" in error.msg:
         break
-    finally:
-      record["event_type"] = %"attempt_finish"
-      record["latency_ms"] = %((getMonoTime() - started).inMilliseconds)
-      let traceDirectory = getEnv("COSINO_ATTEMPT_TRACE_DIR")
-      if traceDirectory.len > 0:
-        writePrivate(traceDirectory / (identity & "-finish.json"), $record & "\n")
   echo "cosino llm: seat ", seat, " falling back to scripted decision"
   result = client.scriptedAction(sim, seat, baseline)
   result.fallback = true
-  result.attemptIds = attemptIds
   result.error = truncateRunes(lastError, MaxErrorLen)

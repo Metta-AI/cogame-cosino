@@ -1,12 +1,13 @@
-# Prompt diversity and candidate training evidence
+# Prompt diversity and training
 
 Hosted configuration selects five training wordings: canonical, plain, numbered,
 questions, and reordered. Mixed selection requires an explicit nonnegative
 promptSeed and chooses seed modulo five. Heldout-briefing and heldout-reference
 are evaluation-only. Selection stays fixed across hands, seats, and retries,
 without changing the shuffle or policy randomness. Canonical preserves the
-original prompt. Variant rules, scoring instructions, action bounds, operator
-strategy, and private observations remain unchanged.
+original prompt. Variants rewrite match accounting, public talk, and legal-action explanations.
+Card rules, scoring values, action bounds, operator strategy, and private
+observations remain fixed.
 
 The bridge supports full text actions for all six published tables:
 
@@ -22,42 +23,29 @@ message hashes are private collection metadata. Training resets reject held-out
 wordings. The synchronous bridge does not reproduce native inference latency,
 spacing, retries, or episode deadlines.
 
-The source exporter requires clean committed source and streams complete private
-candidate trajectories:
+The source exporter requires clean committed source and exports complete matches:
 
 ```sh
 nim c -d:release --path:src -o:/tmp/cosino-export tools/export_posttrain.nim
 /tmp/cosino-export OUTPUT 10 1 kuhn mixed 4
 ```
 
-Records preserve the house policy's original proposal, executed action, exact
-prompts, source revision, and completed outcome. They contain no invented model
-calls or log probabilities. The house policy is an existing scripted teacher;
-its examples do not establish stronger model play.
-
-Convert trajectories.jsonl with the shared Coworld importer and obtain independent
-application review before training admission. All tables, wordings, and seats
-sharing a scenario seed belong to one split. Held-out wording is excluded from
-source training exports. These files are candidate evidence, not approved labels.
+The original train.jsonl, validation.jsonl, and manifest.json formats remain.
+Mixed exports cycle five wordings within the requested match count. The existing
+house teacher supplies legal actions; imitation does not establish stronger play.
+All tables, wordings, and seats sharing a scenario seed belong to one split.
+Seeds divisible by five enter validation; other seeds enter training.
+Held-out wording is excluded from training exports.
 
 Compare base, canonical-trained, and mixed-trained checkpoints on matched seeds,
 seats, opponents, and inference settings. Freeze training choices before evaluating
 held-out wordings. Report completed and incomplete matches, legal actions,
 normalizations, fallbacks, net chips, and native deadline/budget outcomes.
 
-Native capture uses COSINO_HOST_TRACE_PATH for a fresh private host trace,
-COSINO_SOURCE_REVISION for the checked source identity, and
-COSINO_ATTEMPT_TRACE_DIR for actual request start/finish records. Requests
-preserve exact retry prompts and transport model identity. Disabled or scripted
-paths create no inference attempts. Host records identify the returned proposal,
-engine-applied action, fallbacks, selected attempt, and terminal result.
-
-Native diagnostics preserve the ordinary spacing, retries, throttling, decision
-budget, and deadlines. A budget-limited match remains budget-limited in the
-results. Scripted decisions and failed inference are not successful model calls.
-Private prompts, operator strategies, and response evidence stay outside the
-public replay. A parsed proposal can still be rejected by the engine; only host
-execution evidence establishes which action ran.
+Run `tools/test_prompt_games.py BRIDGE` for complete matches, private-card
+checks, normalized actions, and full-range wagers. Run
+`tools/test_export_posttrain.py EXPORTER` for complete mixed exports.
+These checks do not reproduce native inference timing or measure model robustness.
 
 # Numeric reinforcement learning
 

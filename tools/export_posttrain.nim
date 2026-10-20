@@ -68,7 +68,8 @@ when isMainModule:
         let parsed = parseDecision(match.sim, seat, completion)
         doAssert parsed.action == decision.action
         rows.add($(%*{
-          "episode_id": "cosino-" & variant & "-" & $seed & "-" & $selection.selectedVariant,
+          "episode_id": "cosino-" & variant & "-" & $seed & "-" & $selection.variant & "-" &
+              $selection.selectedVariant & "-" & $selection.seed,
           "seed": "cosino-" & $seed,
           "decision_id": decisions,
           "prompt": [

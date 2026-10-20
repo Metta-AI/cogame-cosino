@@ -67,3 +67,6 @@ The native house player supplies legal teacher actions, projected onto the
 nearest wager slot. The observation includes private cards only for the
 acting seat. Opponent cards enter the structured view only after a public
 reveal. The bridge plays complete matches with the native parser and simulator.
+
+Episode IDs include the requested selection, resolved wording, and prompt seed.
+Matched exports remain distinct while scenario seed families stay unchanged.

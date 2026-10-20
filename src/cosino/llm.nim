@@ -16,7 +16,7 @@ import
   std/[json, math, monotimes, os, random, strutils, times],
   bitworld/runtime,
   curly,
-  sim
+  sim, prompts
 
 const
   AnthropicUrl = "https://api.anthropic.com/v1/messages"
@@ -471,30 +471,12 @@ proc variantRules*(config: GameConfig): string =
     "  Min-raise rules apply; a short all-in does not re-open the betting.\n" &
     "- Side pots form per commitment level; split pots share evenly."
 
-proc systemPrompt*(sim: Sim, seat: int): string =
+proc systemPrompt*(sim: Sim, seat: int, selection: PromptSelection): string =
   let config = sim.config
-  "You are " & sim.seatName(seat) & ", a cog playing " &
-    variantName(config.variant, sim.seats.len) &
-    (if config.chipRace: " at the Cosino table.\n\n"
-     else: " at the Cosino ladder.\n\n") &
+  selection.introduction(sim.seatName(seat), variantName(config.variant, sim.seats.len),
+    if config.chipRace: "table" else: "ladder") & "\n\n" &
     variantRules(config) & "\n\n" &
-    (if config.chipRace:
-      "- Every seat bought in ONCE for " & $config.startingStack &
-      " chips. Stacks carry from hand to hand,\n" &
-      "  a seat that loses its last chip is OUT for good (no rebuys), and " &
-      "your score is your final\n" &
-      "  CHIP SHARE — so protecting a short stack counts as much as " &
-      "building a tower.\n"
-     else:
-      "- Every hand starts with both/all seats on " & $config.startingStack &
-      " chips. Your score is your\n" &
-      "  cumulative NET chips across the match, so a chip saved counts " &
-      "exactly as much as a chip won.\n") &
-    "- Table talk is public and free. Bluff, needle and mislead — but your " &
-    "cards stay secret until\n  showdown.\n" &
-    "- Pick exactly one action from the legal list you are given, with an " &
-    "amount inside the stated\n  range. An illegal answer is replaced by a " &
-    "house baseline move, which is never what you want.\n\n" &
+    selection.matchBriefing(config.startingStack, config.chipRace) &
     "Reply with a single JSON object and NOTHING else. Your reply MUST " &
     "begin with the character `{`."
 
@@ -776,6 +758,7 @@ proc decide*(
   seat: int,
   prompt: string,
   scripted: bool,
+  selection: PromptSelection,
   baseline = blHouse,
   header = ""
 ): Decision =
@@ -784,7 +767,7 @@ proc decide*(
   if scripted or client.disabled:
     return client.scriptedAction(sim, seat, baseline)
   client.waitForSpacing()
-  let system = systemPrompt(sim, seat)
+  let system = systemPrompt(sim, seat, selection)
   var lastError = ""
   for attempt in 0 .. 1:
     var user = userPrompt(sim, seat, prompt, header)

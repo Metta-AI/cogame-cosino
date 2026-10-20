@@ -29,6 +29,7 @@ import
   mummy,
   mummy/routers,
   llm,
+  prompts,
   sim
 
 const
@@ -42,6 +43,7 @@ const
 type
   GameState = object
     config: GameConfig
+    selection: PromptSelection
     match: Match
     prompts: seq[string]
     scripted: seq[bool]
@@ -369,7 +371,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       else:
         ## Only the game-hosted prompt path calls Claude from this process.
         decision = client.decide(simCopy, seat, seatPrompt,
-          scripted = seatScripted, baseline = seatBaseline, header = header)
+          scripted = seatScripted, selection = state.selection, baseline = seatBaseline, header = header)
       inc spent
 
       var handEnded = false
@@ -617,10 +619,11 @@ proc runReplayServer*(runtimeConfig: RuntimeConfig) =
   echo "cosino: replay mode on ", runtimeConfig.host, ":", runtimeConfig.port
   gameServer.serve(Port(runtimeConfig.port), runtimeConfig.host)
 
-proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
+proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig, selection: PromptSelection) =
   if config.tokens.len != config.players.len:
     raise newException(CosinoError, "tokens and players must align")
   state.config = config
+  state.selection = selection
   state.match = initMatch(config)
   ## initMatch settles the seed-derived seating; keep the served config in
   ## step so the replay carries the order the hands were actually dealt with.

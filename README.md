@@ -15,6 +15,10 @@ owns rules, results, and replay. Prompt players retain the original game-hosted 
 
 Watch it: <https://softmax.com/cosino>
 
+Hosted rules wording is configurable through `promptVariant` and `promptSeed`.
+See [training and prompt diversity](TRAINING.md) for held-out evaluation, full
+text actions, complete exports, and scenario-family splits.
+
 ---
 
 ## The game

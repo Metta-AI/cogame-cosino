@@ -1,38 +1,52 @@
-# Metta post-training data
+# Prompt diversity and training
 
-The native simulator and published `house` policy export supervised examples
-for all six certified Cosino tables:
+Hosted configuration selects five training wordings: canonical, plain, numbered,
+questions, and reordered. Mixed selection requires an explicit nonnegative
+promptSeed and chooses seed modulo five. Heldout-briefing and heldout-reference
+are evaluation-only. Selection stays fixed across hands, seats, and retries,
+without changing the shuffle or policy randomness. Canonical preserves the
+original prompt. Variants rewrite match accounting, public talk, and legal-action explanations.
+Card rules, scoring values, action bounds, operator strategy, and private
+observations remain fixed.
 
-```sh
-nimby sync nimby.lock
-for variant in kuhn leduc holdem-hu holdem-6max headsup sixmax; do
-  nim r -d:release --path:src tools/export_posttrain.nim \
-    "/tmp/cosino-${variant}" 10 1 "$variant"
-done
-```
-
-Each run reads the table configuration from the Coworld manifest, adds the
-per-seat tokens supplied by the hosted platform, and plays complete seeded
-matches. Every row contains the acting seat's hosted system and user prompts
-and a `house` move accepted by the game's reply parser. Parsed moves drive the
-simulator. Whole matches stay in one split. The manifest records source
-revision, table, hand count, chip results, and row counts. Existing output
-directories are never overwritten.
-
-Train an output with Metta post-training:
+The bridge supports full text actions for all six published tables:
 
 ```sh
-nix develop -c uv run --package metta-posttrain --extra train \
-  python -m metta_posttrain.train --dataset /tmp/cosino-kuhn \
-  --output /tmp/cosino-adapter --model Qwen/Qwen3-0.6B \
-  --max-steps 100 --max-length 4096
+nim c -d:release --path:src -o:/tmp/cosino-bridge tools/train_bridge.nim
+/tmp/cosino-bridge coworld_manifest_template.json holdem-hu text
 ```
 
-Ten matches per table yielded 6,951 examples. Every example fit the
-Qwen2.5-0.5B-Instruct tokenizer in 4,096 tokens; the maximum was 1,060 tokens.
-One CPU optimizer step per table with a local tiny model verifies the Metta
-post-training path. These examples distill the scripted teacher; they do not
-establish stronger league play.
+Text actions retain the full legal wager range and table talk. The real parser,
+simulator, and fallback policy resolve each submitted action. The response reports
+the action actually applied, including fixed-limit amount normalization. Exact
+message hashes are private collection metadata. Training resets reject held-out
+wordings. The synchronous bridge does not reproduce native inference latency,
+spacing, retries, or episode deadlines.
+
+The source exporter requires clean committed source and exports complete matches:
+
+```sh
+nim c -d:release --path:src -o:/tmp/cosino-export tools/export_posttrain.nim
+/tmp/cosino-export OUTPUT 10 1 kuhn mixed 4
+```
+
+The original train.jsonl, validation.jsonl, and manifest.json formats remain.
+Mixed exports cycle five wordings separately within each split. This prevents
+every-fifth-seed validation from excluding a training wording. The existing
+house teacher supplies legal actions; imitation does not establish stronger play.
+All tables, wordings, and seats sharing a scenario seed belong to one split.
+Seeds divisible by five enter validation; other seeds enter training.
+Held-out wording is excluded from training exports.
+
+Compare base, canonical-trained, and mixed-trained checkpoints on matched seeds,
+seats, opponents, and inference settings. Freeze training choices before evaluating
+held-out wordings. Report completed and incomplete matches, legal actions,
+normalizations, fallbacks, net chips, and native deadline/budget outcomes.
+
+Run `tools/test_prompt_games.py BRIDGE` for complete matches, private-card
+checks, normalized actions, and full-range wagers. Run
+`tools/test_export_posttrain.py EXPORTER` for complete mixed exports.
+These checks do not reproduce native inference timing or measure model robustness.
 
 # Numeric reinforcement learning
 
@@ -53,3 +67,6 @@ The native house player supplies legal teacher actions, projected onto the
 nearest wager slot. The observation includes private cards only for the
 acting seat. Opponent cards enter the structured view only after a public
 reveal. The bridge plays complete matches with the native parser and simulator.
+
+Episode IDs include the requested selection, resolved wording, and prompt seed.
+Matched exports remain distinct while scenario seed families stay unchanged.

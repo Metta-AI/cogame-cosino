@@ -31,7 +31,8 @@ nim c -d:release --path:src -o:/tmp/cosino-export tools/export_posttrain.nim
 ```
 
 The original train.jsonl, validation.jsonl, and manifest.json formats remain.
-Mixed exports cycle five wordings within the requested match count. The existing
+Mixed exports cycle five wordings separately within each split. This prevents
+every-fifth-seed validation from excluding a training wording. The existing
 house teacher supplies legal actions; imitation does not establish stronger play.
 All tables, wordings, and seats sharing a scenario seed belong to one split.
 Seeds divisible by five enter validation; other seeds enter training.

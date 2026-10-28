@@ -30,6 +30,7 @@ import
   mummy/routers,
   llm,
   prompts,
+  training_capture,
   sim
 
 const
@@ -44,6 +45,7 @@ type
   GameState = object
     config: GameConfig
     selection: PromptSelection
+    capture: RuntimeCapture
     match: Match
     prompts: seq[string]
     scripted: seq[bool]
@@ -239,6 +241,7 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
 
   sleep(500)
   echo "cosino: writing results and replay"
+  if state.capture != nil: state.capture.finishCapture(results)
   writeArtifact(
     runtimeConfig.resultsUri, $results, "application/json",
     "COGAME_RESULTS_METHOD"
@@ -306,6 +309,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var seatBaseline: Baseline
       var external: bool
       var header: string
+      var capture: CapturedDecision
       var stopNow = false
       withLock stateLock:
         if state.match.done:
@@ -332,6 +336,13 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             seatBaseline = state.baselines[seat]
             external = state.external[seat]
             header = matchHeader()
+            if state.capture != nil:
+              try:
+                capture = state.capture.beginDecision($(spent + 1) & "-" & $seat,
+                  (if external: "external" elif seatScripted: $seatBaseline else: "prompt"),
+                  state.playerObservation(seat), state.selection.selectionMetadata(),
+                  nativeStateHash(state.match.sim))
+              except CatchableError as error: state.capture.captureError(error.msg)
       if stopNow:
         break
 
@@ -371,15 +382,27 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       else:
         ## Only the game-hosted prompt path calls Claude from this process.
         decision = client.decide(simCopy, seat, seatPrompt,
-          scripted = seatScripted, selection = state.selection, baseline = seatBaseline, header = header)
+          scripted = seatScripted, selection = state.selection, baseline = seatBaseline, header = header,
+          capture = capture)
       inc spent
 
       var handEnded = false
       withLock stateLock:
         inc state.decisions[seat]
         ## Degrade twice, never hang: illegal -> baseline -> fold.
+        let beforeEvents = if capture != nil: state.match.sim.events.len else: 0
         let outcome = client.applyDecision(state.match.sim, seat, decision,
           seatBaseline)
+        if capture != nil:
+          try:
+            let noModel = not external and not seatScripted and not client.credentialled()
+            state.capture.applied(capture, seat, decision.action, decision.say,
+              state.match.sim.events[beforeEvents ..< state.match.sim.events.len],
+              outcome.fallbacks > 0 or outcome.forcedFolds > 0 or noModel,
+              outcome.forcedFolds > 0,
+              (if external: "external" elif seatScripted: $seatBaseline else: "model"),
+              $seatBaseline, nativeStateHash(state.match.sim))
+          except CatchableError as error: state.capture.captureError(error.msg)
         state.fallbacks[seat] += outcome.fallbacks
         state.forcedFolds[seat] += outcome.forcedFolds
         if state.match.sim.done:
@@ -628,6 +651,7 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig, selection:
   ## initMatch settles the seed-derived seating; keep the served config in
   ## step so the replay carries the order the hands were actually dealt with.
   state.config = state.match.config
+  state.capture = newRuntimeCapture(state.config, runtimeConfig.resultsUri, runtimeConfig.replayUri)
   let n = config.players.len
   state.prompts = newSeq[string](n)
   state.scripted = newSeq[bool](n)

@@ -74,6 +74,15 @@ names/values; 128 KiB per frozen observation; and 24 MiB per private episode. Ex
 evidence field/decision, records a visible gap and failed capture, and never repairs a response or changes gameplay.
 Publication errors remain visible in logs while normal public results and replay still finish.
 
+Private JSON additionally requires valid Unicode scalar UTF-8 in every key, value, identity and terminal outcome. Lone
+surrogates, malformed byte sequences and unsafe provider/header metadata cannot become selected targets. The
+capture-only guard retains the complete original logical evidence JSON bytes as base64, records a visible error, and
+emits no selected attempt or action for that row. Actual fallback status is preserved. Unsafe terminal outcomes are
+likewise retained as original bytes with failed capture. Valid escaped accents and surrogate pairs remain eligible.
+Native parsing, applied table talk, public replay and subsequent native requests are unchanged, even when the existing
+native parser retains malformed bytes. Decoding the forensic field for inspection never repairs an artifact or creates a
+training target.
+
 Native capture has two private identities. The exact task hash retains effective rules, horizon, predeclared deal
 schedule, seating and match structure. Its conservative split family hashes a fixed 500-index native root dealing stream
 and resolved seating, independently of requested horizon, rules, wording, policy, deadlines and seed labels.
@@ -104,6 +113,27 @@ additional `--mode strict-json` component uses an explicit 42-second fixture tim
 artifacts within 30 seconds/4 MiB, and exits before shutdown grace; it is not a complete ordinary game. Reconstruct it
 with the same checker plus `--allow-truncated`. These are protocol proofs, not genuine platform receipt admission,
 strategic competence, teacher approval or learning evidence.
+
+The maintained Unicode system regression exercises real HTTP replies, native parsing and application, persistent table
+talk in later requests, parsed response headers and the private writer:
+
+```sh
+python3 tools/test_native_capture.py --game /tmp/cosino --player /tmp/cosino-player \
+  --mode unicode --output /tmp/cosino-unicode-proof
+/tmp/cosino-check /tmp/cosino-unicode-proof/config.json \
+  /tmp/cosino-unicode-proof/trajectory.jsonl /tmp/cosino-unicode-proof/replay.json \
+  'native fixture only' --allow-truncated
+python3 tools/test_native_capture.py --game /tmp/cosino --player /tmp/cosino-player \
+  --mode normal --ordinary-clock --output /tmp/cosino-ordinary-proof
+```
+
+The Unicode component keeps the published 250 ms pacing and 60-hand configuration, applies an explicit 42-second fixture
+deadline, and retains the resulting deadline-truncated evidence within 30 seconds/8 MiB. It is not a complete match.
+`--ordinary-clock` retains the manifest's clocks and horizon for a separate full regression (180 seconds/24 MiB). Both
+paths sanitize the driver and child environments, use only a loopback sentinel, record request/response body bytes and
+UUID fixture IDs, and retain wall/call/byte/disk and process CPU/RSS measurements throughout. Literal socket-frame and
+original header octets remain unavailable; parsed headers are the received private evidence. Synthetic usage and fixture
+IDs are not authenticated platform receipts. No provider inference or teacher collection occurs.
 
 # Numeric reinforcement learning
 

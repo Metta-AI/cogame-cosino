@@ -9,6 +9,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -201,7 +202,94 @@ def check_evidence(output, calls, mode):
     }
 
 
+def check_unicode(output, calls, original_source):
+    def scalar(value):
+        if isinstance(value, str):
+            value.encode("utf8")
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                scalar(key)
+                scalar(item)
+        elif isinstance(value, list):
+            for item in value:
+                scalar(item)
+
+    raw = (output / "trajectory.jsonl").read_bytes()
+    try:
+        records = [json.loads(line) for line in raw.decode("utf8").splitlines()]
+        scalar(records)
+        valid = True
+    except (UnicodeError, json.JSONDecodeError):
+        valid = False
+    if original_source:
+        assert not valid, (
+            "original native source did not reproduce unsafe private serialization"
+        )
+        return {
+            "expected_original_invalid_private_json": True,
+            "authenticated_targets": 0,
+        }
+    assert valid and records[-1]["status"] == "failed"
+    wire = {call["call_id"]: call for call in calls}
+    seen, controls = set(), set()
+    forensic = 0
+    for row in records[:-1]:
+        observation = row["observation"]
+        if "invalid_native_evidence_json_b64" in observation:
+            forensic += 1
+            assert (
+                row["selected_attempt_id"] is None
+                and row["executed_action"] is None
+                and row["attempts"] == []
+            )
+            assert row["action_status"] in {"rejected", "fallback"}
+            source = json.loads(
+                base64.b64decode(
+                    observation["invalid_native_evidence_json_b64"], validate=True
+                ).decode("utf8", errors="surrogateescape")
+            )
+            attempts, observation = source["attempts"], source["observation"]
+        else:
+            attempts = row["attempts"]
+        for index, attempt in enumerate(attempts):
+            identity = attempt["platform_call_id"]
+            if identity is None:
+                continue  # No received-call identity remains a visible stage gap, never a synthetic receipt.
+            uuid.UUID(identity)
+            call = wire[identity]
+            assert attempt["response_body_b64"] == call["response_body_b64"]
+            assert (
+                observation["native_requests"][index]["body_b64"]
+                == call["request_body_b64"]
+            )
+            seen.add(identity)
+            if call["fixture_case"] in {"positive-accent", "positive-pair"}:
+                assert attempt["accepted"] and row["action_status"] == "accepted"
+                assert row["executed_action"]["say"] == (
+                    "café" if call["fixture_case"] == "positive-accent" else "😀"
+                )
+                controls.add(call["fixture_case"])
+    assert (
+        seen == set(wire)
+        and forensic
+        and controls == {"positive-accent", "positive-pair"}
+    )
+    return {
+        "strict_scalar_json": True,
+        "forensic_rows": forensic,
+        "all_raw_HTTP_bodies_joined": len(seen),
+        "authenticated_targets": 0,
+    }
+
+
 def main():
+    parent_clean = {
+        key: os.environ[key]
+        for key in ("PATH", "HOME", "TMPDIR", "LANG")
+        if key in os.environ
+    }
+    if set(os.environ) - set(parent_clean) - {"LC_CTYPE", "__CF_USER_TEXT_ENCODING"}:
+        os.execve(sys.executable, [sys.executable, *sys.argv], parent_clean)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--game", type=Path, required=True)
     parser.add_argument("--player", type=Path, required=True)
@@ -209,13 +297,16 @@ def main():
     parser.add_argument("--variant", default="kuhn")
     parser.add_argument("--expect-missing", action="store_true")
     parser.add_argument("--no-capture", action="store_true")
+    parser.add_argument("--ordinary-clock", action="store_true")
+    parser.add_argument("--expect-original-unicode", action="store_true")
     parser.add_argument(
         "--mode",
-        choices=["normal", "mixed", "retry", "throttle-auth", "strict-json"],
+        choices=["normal", "mixed", "retry", "throttle-auth", "strict-json", "unicode"],
         default="normal",
     )
     args = parser.parse_args()
-    component = args.mode == "strict-json"
+    component = args.mode in {"strict-json", "unicode"}
+    assert not args.expect_original_unicode or args.mode == "unicode"
     os.umask(0o077)
     output = args.output.resolve()
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -241,7 +332,11 @@ def main():
             length = int(self.headers["Content-Length"])
             assert 0 < length < 65536 and len(calls) < (32 if component else 440)
             body = self.rfile.read(length)
-            request = json.loads(body)
+            request = json.loads(
+                body.decode("utf8", errors="surrogateescape")
+                if args.mode == "unicode"
+                else body
+            )
             assert request["model"] == "local/cosino-capture-sentinel"
             assert self.headers["X-Coworld-Player-Slot"] == "0"
             assert "native fixture only" in request["messages"][0]["content"]
@@ -272,7 +367,7 @@ def main():
                 status = 429 if not calls else 401
                 text = "local throttle" if status == 429 else "local disabled auth"
             fixture_case = None
-            if component:
+            if args.mode == "strict-json":
                 cases = [
                     ("trailing-object", '{"action":"fold",}'),
                     ("trailing-array", '{"action":"fold","ignored":[1,]}'),
@@ -290,6 +385,44 @@ def main():
                     ("zero-usage", '{"action":"fold"}'),
                 ]
                 fixture_case, text = cases[min(len(calls), len(cases) - 1)]
+            invalid = None
+            if args.mode == "unicode":
+                cases = [
+                    (
+                        "positive-accent",
+                        '```json\n{"action":"fold","say":"caf\\u00e9"}\n```',
+                        None,
+                    ),
+                    ("positive-pair", '{"action":"fold","say":"\\ud83d\\ude00"}', None),
+                    ("metadata", '{"action":"fold","say":"safe"}', None),
+                    ("lone-low", '{"action":"fold","say":"\\udc00"}', None),
+                    ("low-key", '{"action":"fold","\\udc00":1}', None),
+                    ("raw-invalid", '{"action":"fold","say":"INVALID_BYTES"}', b"\x80"),
+                    ("clear", '{"action":"fold","say":"clear"}', None),
+                    (
+                        "overlong",
+                        '{"action":"fold","say":"INVALID_BYTES"}',
+                        b"\xc0\x80",
+                    ),
+                    ("lone-high", '{"action":"fold","say":"\\ud800"}', None),
+                    (
+                        "out-of-range",
+                        '{"action":"fold","say":"INVALID_BYTES"}',
+                        b"\xf4\x90\x80\x80",
+                    ),
+                    (
+                        "continuation",
+                        '{"action":"fold","say":"INVALID_BYTES"}',
+                        b"\xe2\x28\xa1",
+                    ),
+                    (
+                        "truncated",
+                        '{"action":"fold","say":"INVALID_BYTES"}',
+                        b"\xe2\x82",
+                    ),
+                    ("later-safe", '{"action":"fold","say":"safe"}', None),
+                ]
+                fixture_case, text, invalid = cases[min(len(calls), len(cases) - 1)]
             response = {
                 "id": "local-message-" + call,
                 "type": "message",
@@ -307,12 +440,22 @@ def main():
                 response = {"error": {"message": text}}
                 if status == 429:
                     response["padding"] = "x" * 70000
+            if fixture_case == "metadata":
+                response["model"] = "bad\udc00"
             encoded = json.dumps(response).encode()
+            if invalid is not None:
+                encoded = encoded.replace(b"INVALID_BYTES", invalid)
             calls.append(
                 {
                     "call_id": call,
-                    "request_body": body.decode(),
-                    "response_body": encoded.decode(),
+                    "request_body": body.decode("utf8", errors="surrogateescape")
+                    if args.mode == "unicode"
+                    else body.decode(),
+                    "response_body": encoded.decode("utf8", errors="surrogateescape")
+                    if args.mode == "unicode"
+                    else encoded.decode(),
+                    "request_body_b64": base64.b64encode(body).decode(),
+                    "response_body_b64": base64.b64encode(encoded).decode(),
                     "status": status,
                     "fixture_case": fixture_case,
                 }
@@ -325,6 +468,8 @@ def main():
             self.send_header("Content-Length", str(len(encoded)))
             self.send_header("X-Softmax-Llm-Call-Id", call)
             self.send_header("request-id", "local-request-" + call)
+            if fixture_case == "metadata":
+                self.send_header("X-Local-Invalid", "\x80")
             if status == 401:
                 self.send_header("local-overbound-header", "x" * 17000)
             self.end_headers()
@@ -340,9 +485,9 @@ def main():
     config.update(
         tokens=[f"local-token-{s}" for s in range(seats)],
         seed=1,
-        turnDelayMs=0,
-        playerConnectTimeoutSeconds=10,
     )
+    if not args.ordinary_clock and args.mode != "unicode":
+        config.update(turnDelayMs=0, playerConnectTimeoutSeconds=10)
     (output / "config.json").write_text(json.dumps(config))
     # An allowlist prevents inherited provider credentials or remote endpoints reaching either runnable.
     clean = {
@@ -445,9 +590,12 @@ def main():
                 "native absolute wall guard"
             )
             size = sum(p.stat().st_size for p in output.rglob("*") if p.is_file())
-            assert size <= (4 if component else 24) * 1024 * 1024, (
-                "native per-fixture artifact bound"
-            )
+            assert (
+                size
+                <= (8 if args.mode == "unicode" else 4 if component else 24)
+                * 1024
+                * 1024
+            ), "native per-fixture artifact bound"
             if component and all(
                 (output / name).is_file()
                 for name in ["trajectory.jsonl", "results.json", "replay.json"]
@@ -472,6 +620,7 @@ def main():
                             ",".join(str(p.pid) for p in processes),
                         ],
                         capture_output=True,
+                        env=clean,
                         text=True,
                         check=True,
                         timeout=2,
@@ -495,7 +644,13 @@ def main():
         assert partial_finished if component else game.returncode == 0
         for process in processes[1:]:
             assert process.wait(timeout=2 if component else 10) == 0
-        results = json.loads((output / "results.json").read_text())
+        results = json.loads(
+            (output / "results.json")
+            .read_bytes()
+            .decode("utf8", errors="surrogateescape")
+            if args.mode == "unicode"
+            else (output / "results.json").read_text()
+        )
         if component:
             assert (
                 results["reason"] == "deadline"
@@ -518,7 +673,13 @@ def main():
                 "full native game omitted requested private model trajectory"
             )
         evidence = (
-            check_evidence(output, calls, args.mode) if trajectory.exists() else None
+            (
+                check_unicode(output, calls, args.expect_original_unicode)
+                if args.mode == "unicode"
+                else check_evidence(output, calls, args.mode)
+            )
+            if trajectory.exists()
+            else None
         )
         print(
             json.dumps(

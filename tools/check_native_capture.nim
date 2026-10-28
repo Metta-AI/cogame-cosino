@@ -1,6 +1,6 @@
 ## Reconstruct a full ordinary native match without making any model requests.
 ## Usage: check_native_capture CONFIG TRAJECTORY REPLAY OPERATOR_PROMPT
-import std/[json, os, sets, strutils]
+import std/[base64, json, os, sets, strutils]
 import crunchy
 import cosino/[llm, sim, prompts, training_capture]
 
@@ -20,7 +20,17 @@ var rows: seq[JsonNode]
 var summary: JsonNode
 for line in lines(args[1]):
   let row = parseJson(line)
-  if row["event_type"].getStr() == "decision": rows.add(row)
+  if row["event_type"].getStr() == "decision":
+    var inspected = copy(row)
+    if row["observation"].hasKey("invalid_native_evidence_json_b64"):
+      doAssert row["selected_attempt_id"].kind == JNull and row["executed_action"].kind == JNull
+      doAssert row["attempts"].len == 0 and row["action_status"].getStr() in ["rejected", "fallback"]
+      # Inspection only: reconstruct native bytes without rewriting this artifact or its target status.
+      let original = parseJson(decode(row["observation"]["invalid_native_evidence_json_b64"].getStr()))
+      inspected["observation"] = original["observation"]
+      inspected["attempts"] = original["attempts"]
+      inspected["executed_action"] = original["executed_action"]
+    rows.add(inspected)
   else: summary = row
 var counts = newSeq[int](config.players.len)
 var fallbacks = newSeq[int](config.players.len)
@@ -96,10 +106,19 @@ for index, row in rows:
     doAssert request["messages"] == %*[{"role": "user", "content": user}]
     doAssert request["max_tokens"].getInt() == config.maxOutputTokens
     inc promptsChecked
-    if attempt["response"].kind == JString:
+    var reply = attempt["response"].getStr()
+    var hasReply = attempt["response"].kind == JString
+    if not hasReply and attempt["response_body_b64"].kind == JString and
+        attempt["http_status"].getInt() in 200 .. 299:
+      # Unsafe textual copies are absent; replay the real untouched HTTP message bytes.
+      let received = parseJson(decode(attempt["response_body_b64"].getStr()))
+      for contentBlock in received["content"]:
+        if contentBlock{"type"}.getStr() == "text": reply.add(contentBlock{"text"}.getStr())
+      hasReply = true
+    if hasReply:
       try:
         decision = parseDecision(game.sim, seat,
-          extractJsonObject(attempt["response"].getStr()))
+          extractJsonObject(reply))
         parsed = true
       except CatchableError: discard
   if not parsed:
@@ -116,6 +135,17 @@ for index, row in rows:
   var events = newJArray()
   for event in game.sim.events[before ..< game.sim.events.len]: events.add(event.eventToJson())
   doAssert events == execution["events"], "applied native events differ"
+  var expected = %*{"action": "", "say": ""}
+  var appliedActions = 0
+  for event in game.sim.events[before ..< game.sim.events.len]:
+    if event.seat != seat: continue
+    if event.kind == evSay: expected["say"] = %event.text
+    if event.kind == evAction:
+      inc appliedActions
+      expected["action"] = %($event.action)
+      if event.action in [akBet, akRaise]: expected["amount"] = %event.amount
+  doAssert appliedActions == 1 and row["executed_action"] == expected,
+    "captured target differs from independently replayed native command"
   doAssert execution["events_sha256"].getStr() == sha256($events).toHex.toLowerAscii()
   doAssert execution["post_native_sha256"].getStr() ==
     sha256($game.sim.tableStateJson()).toHex.toLowerAscii()

@@ -1,6 +1,6 @@
 ## Optional private evidence from the ordinary native game, never a player or learner.
 import std/[base64, json, math, options, os, parsejson,
-  streams, strutils, tables, unicode, uri]
+  streams, strutils, tables, uri]
 import crunchy, curly, bitworld/runtime
 import ./decision_trajectory, ./sim
 export decision_trajectory, options
@@ -26,18 +26,57 @@ type
     evidenceBytes: int
     errors: seq[string]
 
+proc scalarUtf8(text: string): bool =
+  ## RFC 3629: Nim's validateUtf8 alone permits encoded surrogate code points.
+  var index = 0
+  while index < text.len:
+    let first = ord(text[index])
+    var size = 1
+    if first <= 0x7f: discard
+    elif first in 0xc2 .. 0xdf: size = 2
+    elif first in 0xe0 .. 0xef: size = 3
+    elif first in 0xf0 .. 0xf4: size = 4
+    else: return false
+    if index + size > text.len: return false
+    for offset in 1 ..< size:
+      if ord(text[index + offset]) notin 0x80 .. 0xbf: return false
+    if size >= 3:
+      let second = ord(text[index + 1])
+      if first == 0xe0 and second < 0xa0 or first == 0xed and second > 0x9f or
+          first == 0xf0 and second < 0x90 or first == 0xf4 and second > 0x8f:
+        return false
+    index += size
+  true
+
+proc scalarJson(node: JsonNode, depth = 0): bool =
+  if node == nil or depth > 64: return false
+  case node.kind
+  of JString: return scalarUtf8(node.getStr())
+  of JObject:
+    for key, value in node:
+      if not scalarUtf8(key) or not scalarJson(value, depth + 1): return false
+  of JArray:
+    for value in node:
+      if not scalarJson(value, depth + 1): return false
+  else: discard
+  true
+
+proc safeDiagnostic(detail: string): string =
+  if scalarUtf8(detail): detail
+  else: "non-Unicode diagnostic bytes, base64=" & encode(detail)
+
 proc captureError(capture: CapturedDecision, detail: string) =
   capture.failed = true
   if capture.observation != nil:
     if not capture.observation.hasKey("capture_errors"):
       capture.observation["capture_errors"] = newJArray()
-    capture.observation["capture_errors"].add(%detail)
-  echo "cosino: private capture error: ", detail
+    capture.observation["capture_errors"].add(%safeDiagnostic(detail))
+  echo "cosino: private capture error: ", safeDiagnostic(detail)
 
 proc captureError*(capture: RuntimeCapture, detail: string) =
   capture.failed = true
-  if capture.errors.len < 16: capture.errors.add(detail)
-  echo "cosino: private capture error: ", detail
+  if capture.errors.len < 16: capture.errors.add(safeDiagnostic(detail))
+  echo "cosino: private capture error: ", safeDiagnostic(detail)
 
 proc nativeStateHash*(sim: Sim): string =
   sha256($sim.tableStateJson()).toHex.toLowerAscii()
@@ -90,6 +129,9 @@ proc newRuntimeCapture*(config: GameConfig, resultsUri, replayUri: string): Runt
   if getEnv(CogameSaveTrajectoryUriEnv).len == 0: return nil
   result = RuntimeCapture()
   try:
+    for key in ["COWORLD_EPISODE_ID", "COWORLD_GAME_VERSION", "COWORLD_SOURCE_REVISION", "COWORLD_GAME_NAME"]:
+      if not scalarUtf8(getEnv(key)):
+        raise newException(ValueError, "non-Unicode private trajectory identity: " & key)
     let destination = destinationIdentity(getEnv(CogameSaveTrajectoryUriEnv))
     if destination == destinationIdentity(resultsUri) or
         destination == destinationIdentity(replayUri):
@@ -99,7 +141,7 @@ proc newRuntimeCapture*(config: GameConfig, resultsUri, replayUri: string): Runt
       result.family, "cosino", getEnv("COWORLD_GAME_VERSION"),
       getEnv("COWORLD_SOURCE_REVISION"))
   except CatchableError as error:
-    echo "cosino: private capture initialization failed: ", error.msg
+    echo "cosino: private capture initialization failed: ", safeDiagnostic(error.msg)
     result = nil
 
 proc beginDecision*(capture: RuntimeCapture, id, policy: string,
@@ -166,7 +208,7 @@ proc received*(capture: CapturedDecision, response: Response, latencyMs: int) =
       capture.captureError("response evidence exceeds 65536 bytes; original omitted, no truncation")
     else:
       evidence.responseBodyB64 = some(encode(response.body))
-      if response.body.validateUtf8() < 0: evidence.rawResponse = %response.body
+      if scalarUtf8(response.body): evidence.rawResponse = %response.body
     var headers = initTable[string, string]()
     var headerBytes = 0
     for (key, value) in response.headers:
@@ -208,7 +250,7 @@ proc transportFailed*(capture: CapturedDecision, detail: string, latencyMs: int)
     capture.attempts[^1].responseComplete = some(false)
     capture.attempts[^1].responseReaderJoined = some(true)
     capture.attempts[^1].latencyMs = some(float(latencyMs))
-    capture.attempts[^1].rejectionReason = some(detail)
+    capture.attempts[^1].rejectionReason = some(safeDiagnostic(detail))
   except CatchableError as error: capture.captureError(error.msg)
 
 proc replyText*(capture: CapturedDecision, text: string) =
@@ -218,12 +260,12 @@ proc replyText*(capture: CapturedDecision, text: string) =
       capture.captureError("reply text exceeds 65536 bytes; original omitted, no truncation")
       return
     capture.generated[^1] = text
-    if text.validateUtf8() < 0: capture.attempts[^1].response = %text
+    if scalarUtf8(text): capture.attempts[^1].response = %text
   except CatchableError as error: capture.captureError(error.msg)
 
 proc rejectedAttempt*(capture: CapturedDecision, detail: string) =
   if capture == nil: return
-  try: capture.attempts[^1].rejectionReason = some(detail)
+  try: capture.attempts[^1].rejectionReason = some(safeDiagnostic(detail))
   except CatchableError as error: capture.captureError(error.msg)
 
 proc parsedProposal*(capture: CapturedDecision, action: PlayerAction, say: string) =
@@ -236,7 +278,7 @@ proc parsedProposal*(capture: CapturedDecision, action: PlayerAction, say: strin
 
 proc strictRawObject(text: string): JsonNode =
   ## Reused from Garble's reviewed native-capture strictRawObject; native gameplay decoder is unchanged.
-  if text.validateUtf8() != -1: raise newException(ValueError, "raw JSON is not UTF-8")
+  if not scalarUtf8(text): raise newException(ValueError, "raw JSON is not UTF-8")
   let first = text.find('{')
   let last = text.rfind('}')
   if first < 0 or last < first: raise newException(ValueError, "no raw JSON object")
@@ -279,6 +321,7 @@ proc strictRawObject(text: string): JsonNode =
       while true:
         if parser.tok != tkString: raise newException(ValueError, "JSON object key required")
         let key = parser.a
+        if not scalarUtf8(key): raise newException(ValueError, "non-Unicode decoded JSON key")
         if result.hasKey(key): raise newException(ValueError, "duplicate JSON key: " & key)
         discard parser.getTok()
         parser.eat(tkColon)
@@ -300,6 +343,7 @@ proc strictRawObject(text: string): JsonNode =
           break
         parser.eat(tkComma)
     of tkString:
+      if not scalarUtf8(parser.a): raise newException(ValueError, "non-Unicode decoded JSON string")
       result = %parser.a
       discard parser.getTok()
     of tkInt, tkFloat:
@@ -400,6 +444,21 @@ proc applied*(capture: RuntimeCapture, decision: CapturedDecision,
           status = asAccepted
         else:
           evidence.rejectionReason = some("strict JSON grammar/depth or supplied field/type/value differs from applied action")
+    var originalAttempts = newJArray()
+    for evidence in decision.attempts: originalAttempts.add(attemptEvidenceJson(evidence))
+    let original = %*{"observation": decision.observation, "attempts": originalAttempts,
+      "executed_action": actual, "actual_scripted": origin != "model" or fallback}
+    if not scalarJson(original):
+      # Evidence only: retain actual original bytes, never repair gameplay or a completion.
+      let detail = "non-Unicode native evidence; original JSON bytes retained as base64; target excluded"
+      decision.observation = %*{"capture_errors": [detail],
+        "actual_scripted": origin != "model" or fallback,
+        "invalid_native_evidence_json_b64": encode($original)}
+      decision.attempts = @[]
+      decision.failed = true
+      selected = none(string)
+      actual = newJNull()
+      if status != asFallback: status = asRejected
     if decision.failed:
       capture.failed = true
       if decision.observation.hasKey("capture_errors"):
@@ -424,15 +483,20 @@ proc finishCapture*(capture: RuntimeCapture, outcome: JsonNode) =
   try:
     if capture.trajectory == nil:
       raise newException(ValueError, "trajectory initialization failed")
+    var privateOutcome = copy(outcome)
+    var scores = outcome{"scores"}
+    if not scalarJson(outcome):
+      capture.captureError("non-Unicode native outcome; original JSON bytes retained as base64")
+      privateOutcome = %*{"invalid_native_outcome_json_b64": encode($outcome)}
+    if not scalarJson(scores): scores = newJNull()
     let status = if capture.failed: esFailed
       elif outcome{"reason"}.getStr() == "complete": esCompleted else: esTruncated
-    var privateOutcome = copy(outcome)
     if capture.failed:
       privateOutcome["capture_errors"] = %capture.errors
-    capture.trajectory.finish(status, privateOutcome, outcome{"scores"})
+    capture.trajectory.finish(status, privateOutcome, scores)
     if capture.trajectory.eventsJsonl().len > MaxEpisodeEvidenceBytes:
       raise newException(ValueError, "private episode exceeds 24 MiB; publication omitted, no truncation")
     capture.trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
   except CatchableError as error:
     # Evidence faults are visible but never change public results, replay, or gameplay.
-    echo "cosino: private capture publication failed: ", error.msg
+    echo "cosino: private capture publication failed: ", safeDiagnostic(error.msg)

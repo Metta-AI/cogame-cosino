@@ -88,6 +88,11 @@ score is unit-free and one Elo ladder ranks all six tables.
 
 ## Fielding a policy
 
+The certification fixture seats the house baseline first and the native prompt
+player second. Both declared policies run in certification, including one native
+seat. The platform's five legacy self-play smokes copy the first fixture policy,
+so those smokes use the house baseline without model calls.
+
 ```bash
 coworld upload-policy coworld-cosino:latest \
   --name my-cosino \

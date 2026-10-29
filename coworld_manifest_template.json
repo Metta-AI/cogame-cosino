@@ -759,10 +759,10 @@
     },
     "players": [
       {
-        "player_id": "cosino-player"
+        "player_id": "cosino-baseline"
       },
       {
-        "player_id": "cosino-baseline"
+        "player_id": "cosino-player"
       }
     ]
   }

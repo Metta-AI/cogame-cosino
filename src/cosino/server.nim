@@ -306,6 +306,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var seat: int
       var seatPrompt: string
       var seatScripted: bool
+      var seatRegistered: bool
       var seatBaseline: Baseline
       var external: bool
       var header: string
@@ -332,15 +333,21 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             stopNow = true
           else:
             seatPrompt = state.prompts[seat]
-            seatScripted = state.scripted[seat]
+            seatRegistered = state.registered[seat]
+            seatScripted = not seatRegistered or state.scripted[seat]
             seatBaseline = state.baselines[seat]
-            external = state.external[seat]
+            external = seatRegistered and state.external[seat]
             header = matchHeader()
             if state.capture != nil:
               try:
+                var privateObservation = state.playerObservation(seat)
+                privateObservation["native_registration"] = %*{
+                  "registered": seatRegistered,
+                  "connected": state.playerSockets.hasKey(seat),
+                  "external": external, "scripted": seatScripted and not external}
                 capture = state.capture.beginDecision($(spent + 1) & "-" & $seat,
-                  (if external: "external" elif seatScripted: $seatBaseline else: "prompt"),
-                  state.playerObservation(seat), state.selection.selectionMetadata(),
+                  (if not seatRegistered: "unregistered" elif external: "external" elif seatScripted: $seatBaseline else: "prompt"),
+                  privateObservation, state.selection.selectionMetadata(),
                   nativeStateHash(state.match.sim))
               except CatchableError as error: state.capture.captureError(error.msg)
       if stopNow:
@@ -349,8 +356,10 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var decision: Decision
       if external:
         var sent = false
+        var pendingSocket: WebSocket
         withLock stateLock:
-          if state.playerSockets.hasKey(seat):
+          if state.registered[seat] and state.external[seat] and state.playerSockets.hasKey(seat):
+            pendingSocket = state.playerSockets[seat]
             inc state.decisionId
             state.pendingSeat = seat
             state.pendingAccepted = false
@@ -368,6 +377,9 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             accepted = state.pendingAccepted
             if accepted:
               decision = state.pendingDecision
+            elif not state.external[seat] or
+                state.playerSockets.getOrDefault(seat) != pendingSocket:
+              sent = false
           if accepted:
             break
           sleep(50)
@@ -384,6 +396,8 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         decision = client.decide(simCopy, seat, seatPrompt,
           scripted = seatScripted, selection = state.selection, baseline = seatBaseline, header = header,
           capture = capture)
+      if not seatRegistered:
+        decision.fallback = true
       inc spent
 
       var handEnded = false
@@ -400,7 +414,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
               state.match.sim.events[beforeEvents ..< state.match.sim.events.len],
               outcome.fallbacks > 0 or outcome.forcedFolds > 0 or noModel,
               outcome.forcedFolds > 0,
-              (if external: "external" elif seatScripted: $seatBaseline else: "model"),
+              (if not seatRegistered: "unregistered" elif external: "external" elif seatScripted: $seatBaseline else: "model"),
               $seatBaseline, nativeStateHash(state.match.sim))
           except CatchableError as error: state.capture.captureError(error.msg)
         state.fallbacks[seat] += outcome.fallbacks
@@ -505,6 +519,8 @@ proc playerUpgradeHandler(request: Request) {.gcsafe.} =
       return
     let websocket = request.upgradeToWebSocket()
     withLock stateLock:
+      if state.playerSockets.hasKey(slot):
+        state.socketSlots.del(state.playerSockets[slot])
       state.playerSockets[slot] = websocket
       state.socketSlots[websocket] = slot
       echo "cosino: player slot ", slot, " connected (",
@@ -560,13 +576,22 @@ proc websocketHandler(
         return
       try:
         let payload = parseJson(message.data)
-        if payload{"type"}.getStr() == "prompt":
+        if payload.kind != JObject or not payload.hasKey("type") or
+            payload["type"].kind != JString:
+          return
+        if payload["type"].getStr() == "prompt":
+          if not payload.hasKey("prompt") or payload["prompt"].kind != JString or
+              (payload.hasKey("scripted") and payload["scripted"].kind != JBool) or
+              (payload.hasKey("baseline") and payload["baseline"].kind != JString):
+            return
           ## Rune-truncated, never byte-truncated: a byte cut mid-rune renders
           ## in a browser and then fails a strict UTF-8 parser downstream.
           let prompt = truncateRunes(payload{"prompt"}.getStr(), MaxPromptLen)
           let scripted = payload{"scripted"}.getBool(false)
           let baseline = parseBaseline(payload{"baseline"}.getStr("house"))
           withLock stateLock:
+            if state.playerSockets.getOrDefault(slot) != websocket:
+              return
             state.prompts[slot] = prompt
             state.scripted[slot] = scripted
             state.baselines[slot] = baseline
@@ -577,6 +602,8 @@ proc websocketHandler(
         elif payload{"type"}.getStr() == "register" and
             payload["control"].getStr() == "external":
           withLock stateLock:
+            if state.playerSockets.getOrDefault(slot) != websocket:
+              return
             state.registered[slot] = true
             state.external[slot] = true
           echo "cosino: slot ", slot, " registered external control"
@@ -586,16 +613,15 @@ proc websocketHandler(
           let amount = payload{"amount"}.getInt(0)
           let say = truncateRunes(payload{"say"}.getStr().strip(), MaxSayLen)
           withLock stateLock:
-            if state.external[slot] and state.pendingSeat == slot and
+            if state.playerSockets.getOrDefault(slot) == websocket and
+                state.registered[slot] and state.external[slot] and state.pendingSeat == slot and
                 state.decisionId == id and not state.pendingAccepted:
               state.pendingDecision = Decision(
                 say: say, action: PlayerAction(kind: kind, amount: amount))
               state.pendingAccepted = true
       except CatchableError as error:
         echo "cosino: ignoring bad player frame: ", error.msg
-    of ErrorEvent:
-      discard
-    of CloseEvent:
+    of ErrorEvent, CloseEvent:
       withLock stateLock:
         if websocket in state.socketSlots:
           let slot = state.socketSlots[websocket]

@@ -135,6 +135,47 @@ UUID fixture IDs, and retain wall/call/byte/disk and process CPU/RSS measurement
 original header octets remain unavailable; parsed headers are the received private evidence. Synthetic usage and fixture
 IDs are not authenticated platform receipts. No provider inference or teacher collection occurs.
 
+## Registration readiness and connection ownership
+
+A seat uses the house fallback until it has delivered a valid registration. Prompt frames require a string `prompt`;
+optional `scripted` and `baseline` fields must have their documented boolean and string types. A valid late registration
+changes subsequent decisions. Delivered native prompts and scripted strategies belong to the game and remain valid after
+their socket disconnects. Only the current socket may change a seat's registration or submit its pending external action;
+replaced sockets and their later close events cannot overwrite a successor. External control can fall back when its
+transport disappears. An already accepted action is not retroactively revoked.
+
+Private `native_registration` metadata records the cached registration and effective decision mode separately from live
+connection presence. Never-registered fallback rows have no model attempts or selected target. The source-native checker
+validates these booleans, mode, origin and target exclusions before removing private metadata from its gameplay-view
+comparison. Effective `scripted` is false for external dispatch, including a current-owner scripted-to-external switch;
+this does not erase the cached strategy or alter dispatch. Legacy trajectories without this metadata retain their existing checks. Registration fixtures explicitly report
+unresolved transport connection vectors; simulator replay does not independently reconstruct socket timing. All other
+private gameplay fields, prompts, parsed actions, events, replay and terminal outcomes remain checked.
+
+The maintained harness accepts `--registration-case missing|late|malformed|scripted|external|disconnect|replacement|scripted-external`.
+These are explicit deadline components: the published hand count and pacing remain intact, while the component sets a
+20-second episode timeout and one-second connection timeout. They are not complete ordinary matches. Raw frames, all-slot
+loopback HTTP, native artifacts, process exits and resource measurements remain private evidence. `--expect-registration-bug`
+is only for the retained old-binary missing/late RED controls. `--http-budget-state` enforces the shared synthetic-call cap.
+Use a fresh owned output path for every invocation; do not rerun a paid hosted game to reproduce this local protocol proof.
+
+```sh
+python3 tools/test_native_capture.py --game /new/owned/cosino --player /recorded/cosino-player \
+  --registration-case missing --output /new/owned/missing
+/new/owned/cosino-check /new/owned/missing/config.json /new/owned/missing/trajectory.jsonl \
+  /new/owned/missing/replay.json 'native fixture only' --allow-truncated \
+  --registration-contract /new/owned/missing/registration-contract.json
+```
+
+Retain one separate `--mode normal --ordinary-clock` regression with all 60 Kuhn hands. Component success cannot replace
+that full-game result. The retained 60-hand ordinary proof uses binary `b7e1452586ec483176c627e0a01f75a912bfce93256704af39e7d8931826a441`
+and predates the subsequent effective-mode metadata correction. Its new expression `seatScripted and not external` equals
+the previous value whenever external control is false; the full ordinary game was not rerun for that metadata-only change.
+The `scripted-external` component waits for scripted and then external registration acknowledgements on the same current
+socket before starting the other seat; the final checker validates its accepted external decisions with no model attempts
+or selected targets. Fixture UUIDs, usage counters and responses are synthetic: zero provider inference, authenticated
+teacher targets, GPU allocation or optimizer updates follow from these checks.
+
 # Numeric reinforcement learning
 
 Compile the persistent bridge and pass its binary, manifest, and variant to Metta's `recipes.external.coworld.train`

@@ -304,13 +304,31 @@ def main():
         choices=["normal", "mixed", "retry", "throttle-auth", "strict-json", "unicode"],
         default="normal",
     )
+    parser.add_argument(
+        "--registration-case",
+        choices=[
+            "missing",
+            "late",
+            "malformed",
+            "scripted",
+            "external",
+            "disconnect",
+            "replacement",
+            "scripted-external",
+        ],
+    )
+    parser.add_argument("--expect-registration-bug", action="store_true")
+    parser.add_argument("--http-budget-state", type=Path)
     args = parser.parse_args()
-    component = args.mode in {"strict-json", "unicode"}
+    registration = args.registration_case
+    component = args.mode in {"strict-json", "unicode"} or bool(registration)
     assert not args.expect_original_unicode or args.mode == "unicode"
     os.umask(0o077)
     output = args.output.resolve()
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
     calls = []
+    protocol_errors = []
+    ws_clients = []
 
     class Sentinel(http.server.BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:
@@ -338,8 +356,7 @@ def main():
                 else body
             )
             assert request["model"] == "local/cosino-capture-sentinel"
-            assert self.headers["X-Coworld-Player-Slot"] == "0"
-            assert "native fixture only" in request["messages"][0]["content"]
+            slot = self.headers["X-Coworld-Player-Slot"]
             call = str(uuid.uuid4())
             text = '{"action":"fold","say":""}'
             status = 200
@@ -447,6 +464,7 @@ def main():
                 encoded = encoded.replace(b"INVALID_BYTES", invalid)
             calls.append(
                 {
+                    "slot": slot,
                     "call_id": call,
                     "request_body": body.decode("utf8", errors="surrogateescape")
                     if args.mode == "unicode"
@@ -461,8 +479,17 @@ def main():
                 }
             )
             calls[-1]["elapsed_seconds"] = time.monotonic() - started
+            if args.http_budget_state:
+                budget = json.loads(args.http_budget_state.read_text())
+                budget["count"] += 1
+                args.http_budget_state.write_text(json.dumps(budget) + "\n")
+                if budget["count"] > budget["cap"]:
+                    protocol_errors.append("aggregate HTTP bound")
             with (output / "http-calls.jsonl").open("a") as archive:
                 archive.write(json.dumps(calls[-1]) + "\n")
+            if not registration:
+                assert slot == "0"
+                assert "native fixture only" in request["messages"][0]["content"]
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(encoded)))
@@ -486,9 +513,30 @@ def main():
         tokens=[f"local-token-{s}" for s in range(seats)],
         seed=1,
     )
-    if not args.ordinary_clock and args.mode != "unicode":
-        config.update(turnDelayMs=0, playerConnectTimeoutSeconds=10)
+    if not args.ordinary_clock and args.mode != "unicode" and not registration:
+        config.update(turnDelayMs=0, player_connect_timeout_seconds=10)
+    if registration:
+        config["player_connect_timeout_seconds"] = 1
     (output / "config.json").write_text(json.dumps(config))
+    if registration:
+        (output / "registration-contract.json").write_text(
+            json.dumps(
+                {
+                    "case": "external"
+                    if registration == "scripted-external"
+                    else registration,
+                    "registration_profile": registration,
+                    "control_sequence": ["scripted-rock", "external"]
+                    if registration == "scripted-external"
+                    else [registration],
+                    "prompt": "native fixture only",
+                    "external_action": "fold",
+                    "transport_connection_field": "UNRESOLVED: independently retained WS chronology does not bind every predecision connection vector",
+                },
+                indent=2,
+            )
+            + "\n"
+        )
     # An allowlist prevents inherited provider credentials or remote endpoints reaching either runnable.
     clean = {
         k: os.environ[k] for k in ("PATH", "HOME", "TMPDIR", "LANG") if k in os.environ
@@ -511,7 +559,7 @@ def main():
     }
     if component:
         env["COWORLD_TIMEOUT_SECONDS"] = (
-            "42"  # Explicit partial component; native truncation only.
+            "20" if registration else "42"  # Explicit partial component only.
         )
     if args.no_capture:
         del env["COGAME_SAVE_TRAJECTORY_URI"]
@@ -563,7 +611,136 @@ def main():
             except OSError:
                 assert time.monotonic() < healthy_by, "native health deadline"
                 time.sleep(0.05)
-        for seat in range(seats):
+        if registration:
+            import websocket
+
+            def wire_send(client, value):
+                client.send(json.dumps(value))
+                with (output / "registration-wire.jsonl").open("a") as stream:
+                    stream.write(
+                        json.dumps(
+                            {
+                                "elapsed_seconds": time.monotonic() - started,
+                                "sent": value,
+                            }
+                        )
+                        + "\n"
+                    )
+
+            url = f"ws://127.0.0.1:{port}/player?slot=0&token=local-token-0"
+            controller = websocket.create_connection(url, timeout=1)
+            ws_clients.append(controller)
+            controller.recv()  # welcome: ownership has been installed before any frame.
+            native = {
+                "type": "prompt",
+                "prompt": "native fixture only",
+                "scripted": False,
+                "baseline": "house",
+            }
+            if registration == "malformed":
+                for value in [
+                    {"type": "prompt"},
+                    {"type": "prompt", "prompt": 7},
+                    {
+                        "type": "prompt",
+                        "prompt": "native fixture only",
+                        "scripted": "false",
+                    },
+                    {"type": "prompt", "prompt": "native fixture only", "baseline": 7},
+                ]:
+                    wire_send(controller, value)
+            elif registration == "scripted":
+                wire_send(controller, native | {"scripted": True, "baseline": "rock"})
+            elif registration in {"external", "scripted-external"}:
+                if registration == "scripted-external":
+                    wire_send(
+                        controller, native | {"scripted": True, "baseline": "rock"}
+                    )
+                    until = time.monotonic() + 3
+                    while "scripted rock" not in (output / "game.log").read_text():
+                        assert time.monotonic() < until
+                        time.sleep(0.01)
+                wire_send(controller, {"type": "register", "control": "external"})
+                if registration == "scripted-external":
+                    until = time.monotonic() + 3
+                    while (
+                        "registered external control"
+                        not in (output / "game.log").read_text()
+                    ):
+                        assert time.monotonic() < until
+                        time.sleep(0.01)
+            elif registration in {"disconnect", "replacement"}:
+                wire_send(controller, native)
+            if registration == "replacement":
+                previous = controller
+                controller = websocket.create_connection(url, timeout=1)
+                ws_clients.append(controller)
+                controller.recv()
+                wire_send(controller, native | {"scripted": True, "baseline": "rock"})
+                # Wait for the existing source acknowledgement log before starting the other seat.
+                until = time.monotonic() + 3
+                while "scripted rock" not in (output / "game.log").read_text():
+                    assert time.monotonic() < until
+                    time.sleep(0.01)
+                wire_send(previous, native)
+                wire_send(previous, {"type": "register", "control": "external"})
+                wire_send(previous, {"type": "action", "id": 1, "kind": "fold"})
+                previous.close()
+
+            def controller_loop():
+                delivered = False
+                disconnected = False
+                while game.poll() is None:
+                    try:
+                        frame = json.loads(controller.recv())
+                    except websocket.WebSocketTimeoutException:
+                        continue
+                    except (
+                        websocket.WebSocketException,
+                        OSError,
+                        json.JSONDecodeError,
+                    ):
+                        return
+                    with (output / "registration-wire.jsonl").open("a") as stream:
+                        stream.write(
+                            json.dumps(
+                                {
+                                    "elapsed_seconds": time.monotonic() - started,
+                                    "received": frame,
+                                }
+                            )
+                            + "\n"
+                        )
+                    if (
+                        registration in {"external", "scripted-external"}
+                        and frame.get("type") == "observation"
+                    ):
+                        wire_send(
+                            controller,
+                            {
+                                "type": "action",
+                                "id": frame["id"],
+                                "kind": "fold",
+                                "say": "",
+                            },
+                        )
+                    acted = any(
+                        e.get("kind") == "action" and e.get("seat") == 0
+                        for e in frame.get("events", [])
+                    )
+                    if registration in {"scripted", "external"} and acted:
+                        controller.close()
+                        return
+                    if registration == "late" and acted and not delivered:
+                        delivered = True
+                        wire_send(controller, native)
+                    if registration == "disconnect" and acted and not disconnected:
+                        disconnected = True
+                        controller.close()
+                        return
+
+            threading.Thread(target=controller_loop, daemon=True).start()
+        for seat in range(1 if registration else 0, seats):
             player_env = clean | {
                 "COWORLD_PLAYER_WS_URL": f"ws://127.0.0.1:{port}/player?slot={seat}&token=local-token-{seat}"
             }
@@ -586,6 +763,7 @@ def main():
         next_measurement = 0.0
         partial_finished = False
         while game.poll() is None:
+            assert not protocol_errors, protocol_errors
             assert time.monotonic() - started < (30 if component else 180), (
                 "native absolute wall guard"
             )
@@ -661,7 +839,41 @@ def main():
                 results["reason"] == "complete"
                 and results["handsPlayed"] == config["hands"]
             )
-        assert calls, "no native loopback model requests"
+        if not registration:
+            assert calls, "no native loopback model requests"
+        else:
+            records = [
+                json.loads(line)
+                for line in (output / "trajectory.jsonl").read_text().splitlines()
+            ]
+            own = [
+                row
+                for row in records
+                if row.get("event_type") == "decision" and row["seat"] == "0"
+            ]
+            if args.expect_registration_bug:
+                assert calls, "predicted old registration bug did not reproduce"
+            elif registration in {
+                "missing",
+                "malformed",
+                "scripted",
+                "external",
+                "replacement",
+                "scripted-external",
+            }:
+                assert not calls, "registration profile made unexpected native HTTP"
+            elif registration == "late":
+                assert calls and any(
+                    row["observation"]["native_registration"]["registered"] is False
+                    for row in own
+                )
+                assert any(row["attempts"] for row in own)
+            elif registration == "disconnect":
+                assert calls and any(
+                    row["attempts"]
+                    and not row["observation"]["native_registration"]["connected"]
+                    for row in own
+                ), "delivered native strategy did not survive disconnect"
         (output / "http-calls.json").write_text(json.dumps(calls, indent=2) + "\n")
         trajectory = output / "trajectory.jsonl"
         if args.expect_missing or args.no_capture:
@@ -678,12 +890,16 @@ def main():
                 if args.mode == "unicode"
                 else check_evidence(output, calls, args.mode)
             )
-            if trajectory.exists()
+            if trajectory.exists() and not registration
             else None
         )
         print(
             json.dumps(
                 {
+                    "registration_case": registration,
+                    "old_bug_reproduced": bool(
+                        registration and args.expect_registration_bug
+                    ),
                     "variant": args.variant,
                     "mode": args.mode,
                     "capture_enabled": not args.no_capture,
@@ -699,6 +915,12 @@ def main():
             )
         )
     finally:
+        for client in ws_clients:
+            try:
+                client.close()
+            except (websocket.WebSocketException, OSError) as error:
+                with (output / "socket-close-errors.jsonl").open("a") as stream:
+                    stream.write(json.dumps({"type": type(error).__name__}) + "\n")
         for process in processes:
             if process.poll() is None:
                 process.terminate()
@@ -710,6 +932,16 @@ def main():
         fixture.shutdown()
         for log in logs:
             log.close()
+        (output / "owned-terminal-processes.json").write_text(
+            json.dumps(
+                [
+                    {"pid": process.pid, "returncode": process.poll()}
+                    for process in processes
+                ],
+                indent=2,
+            )
+            + "\n"
+        )
 
 
 if __name__ == "__main__":

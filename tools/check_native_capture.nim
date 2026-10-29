@@ -5,8 +5,12 @@ import crunchy
 import cosino/[llm, sim, prompts, training_capture]
 
 let args = commandLineParams()
-doAssert args.len in [4, 5]
-let allowTruncated = args.len == 5 and args[4] == "--allow-truncated"
+doAssert args.len >= 4
+let allowTruncated = "--allow-truncated" in args
+let contractIndex = args.find("--registration-contract")
+let registrationContract = if contractIndex >= 0:
+  parseFile(args[contractIndex + 1]) else: newJNull()
+var unresolvedConnections = 0
 let configNode = parseFile(args[0])
 var config = defaultGameConfig()
 config.update($configNode)
@@ -87,10 +91,41 @@ for index, row in rows:
   let execution = view["native_execution"]
   doAssert view["pre_native_sha256"].getStr() ==
     sha256($game.sim.tableStateJson()).toHex.toLowerAscii()
+  if view.hasKey("native_registration"):
+    let control = view["native_registration"]
+    for field in ["registered", "connected", "external", "scripted"]:
+      doAssert control.hasKey(field) and control[field].kind == JBool,
+        "registration metadata needs explicit booleans"
+    let origin = execution["origin"].getStr()
+    if not control["registered"].getBool():
+      doAssert origin == "unregistered" and control["scripted"].getBool() and
+        not control["external"].getBool()
+      doAssert row["attempts"].len == 0 and row["selected_attempt_id"].kind == JNull
+      doAssert row["action_status"].getStr() == "fallback"
+    elif control["external"].getBool():
+      doAssert origin == "external" and not control["scripted"].getBool()
+      doAssert row["attempts"].len == 0 and row["selected_attempt_id"].kind == JNull
+      doAssert registrationContract.kind == JObject and
+        registrationContract["case"].getStr() == "external"
+    elif control["scripted"].getBool():
+      doAssert origin in ["house", "rock"] and row["attempts"].len == 0 and
+        row["selected_attempt_id"].kind == JNull
+    else:
+      doAssert origin == "model"
+    view.delete("native_registration")
+  var expectedView = observation(game, seat)
+  if registrationContract.kind == JObject:
+    # Socket lifecycle is external to the simulator. Do not claim an independent
+    # reconstruction of a connection vector from the trajectory's own flags.
+    doAssert view["connected"].len == config.players.len
+    for connected in view["connected"]: doAssert connected.kind == JBool
+    view.delete("connected")
+    expectedView.delete("connected")
+    inc unresolvedConnections
   for field in ["scenario_family", "task_identity", "prompt_selection",
       "pre_native_sha256", "native_parsed_proposals", "native_requests", "native_execution", "capture_errors"]:
     if view.hasKey(field): view.delete(field)
-  doAssert view == observation(game, seat), "private native view differs at " & row["decision_id"].getStr()
+  doAssert view == expectedView, "private native view differs at " & row["decision_id"].getStr()
   var decision: Decision
   var parsed = false
   for attemptIndex, attempt in row["attempts"].getElems():
@@ -123,11 +158,16 @@ for index, row in rows:
       except CatchableError: discard
   if not parsed:
     let origin = execution["origin"].getStr()
-    doAssert origin in ["model", "house", "rock"]
-    decision = client.scriptedAction(game.sim, seat,
-      if origin == "rock": blRock else: blHouse)
+    doAssert origin in ["model", "house", "rock", "unregistered", "external"]
+    if origin == "external" and row["action_status"].getStr() != "fallback":
+      doAssert registrationContract.kind == JObject and
+        registrationContract["external_action"].getStr() == "fold"
+      decision = parseDecision(game.sim, seat, %*{"action": "fold", "say": ""})
+    else:
+      decision = client.scriptedAction(game.sim, seat,
+        if origin == "rock": blRock else: blHouse)
     # The original disabled-client early return does not increment native fallback counters.
-    decision.fallback = row["attempts"].len > 0
+    decision.fallback = row["attempts"].len > 0 or origin == "unregistered" or (origin == "external" and row["action_status"].getStr() == "fallback")
   doAssert execution["parsed_action"] == %*{
     "action": $decision.action.kind, "amount": decision.action.amount, "say": decision.say}
   let before = game.sim.events.len
@@ -211,7 +251,9 @@ for index in 0 ..< min(originalDeals.len, otherDeals.len):
 for deal in originalDeals:
   if deal in otherDeals: sharedDeals.incl(deal)
 echo pretty(%*{"complete_episode": game.reason == erComplete, "native_reason": $game.reason, "hands": game.handsPlayed, "decisions": rows.len,
-  "prompt_requests": promptsChecked, "all_private_views_prompts_applied_events_replay_outcome_verified": true,
+  "prompt_requests": promptsChecked, "all_private_views_prompts_applied_events_replay_outcome_verified": unresolvedConnections == 0,
+  "all_gameplay_private_fields_prompts_actions_replay_outcome_verified": true,
+  "unresolved_transport_connection_vectors": unresolvedConnections,
   "split_family": ids.family, "task_identity": ids.task,
   "horizon_and_same_deal_rule_grouping_verified": true,
   "model_and_delay_identity_exclusion_verified": true,

@@ -16,7 +16,7 @@ import
   std/[json, math, monotimes, os, random, strutils, times],
   bitworld/runtime,
   curly,
-  sim, prompts
+  sim, prompts, training_capture
 
 const
   AnthropicUrl = "https://api.anthropic.com/v1/messages"
@@ -625,7 +625,8 @@ proc extractJsonObject*(text: string): JsonNode =
     raise newException(CosinoError, "no JSON object in response")
   parseJson(text[start .. stop])
 
-proc completeText(client: LlmClient, system, user: string, slot: int): string =
+proc completeText(client: LlmClient, system, user: string, slot: int,
+    capture: CapturedDecision = nil): string =
   var body = %*{
     "max_tokens": client.maxOutputTokens,
     "system": system,
@@ -651,7 +652,19 @@ proc completeText(client: LlmClient, system, user: string, slot: int): string =
     headers["anthropic-version"] = AnthropicVersion
     url = AnthropicUrl
   ## `output_config.effort` is NOT sent: Haiku 4.5 rejects it.
-  let response = client.curl.post(url, headers, $body, client.timeoutSeconds)
+  let encoded = $body
+  if capture != nil: capture.requested(encoded, headers)
+  var started: MonoTime
+  if capture != nil: started = getMonoTime()
+  var response: Response
+  try:
+    response = client.curl.post(url, headers, encoded, client.timeoutSeconds)
+  except CatchableError as error:
+    if capture != nil:
+      capture.transportFailed(error.msg, (getMonoTime() - started).inMilliseconds.int)
+    raise
+  if capture != nil:
+    capture.received(response, (getMonoTime() - started).inMilliseconds.int)
   if response.code == 401 or response.code == 403:
     let detail = response.body[0 .. min(response.body.high, 400)]
     if "Model access is denied" in response.body and
@@ -760,7 +773,8 @@ proc decide*(
   scripted: bool,
   selection: PromptSelection,
   baseline = blHouse,
-  header = ""
+  header = "",
+  capture: CapturedDecision = nil
 ): Decision =
   ## One decision for one seat. Never raises: any failure degrades to the
   ## scripted baseline so the game always advances.
@@ -774,10 +788,16 @@ proc decide*(
     if attempt > 0:
       user.add("\nYour previous reply was invalid. Respond with ONLY the " &
         "requested JSON object and a legal action with a legal amount.")
+    if capture != nil: capture.beginAttempt()
     try:
-      let payload = extractJsonObject(client.completeText(system, user, seat))
-      return parseDecision(sim, seat, payload)
+      let text = client.completeText(system, user, seat, capture)
+      if capture != nil: capture.replyText(text)
+      let payload = extractJsonObject(text)
+      result = parseDecision(sim, seat, payload)
+      if capture != nil: capture.parsedProposal(result.action, result.say)
+      return
     except CatchableError as error:
+      if capture != nil: capture.rejectedAttempt(error.msg)
       lastError = error.msg
       echo "cosino llm: seat ", seat, " attempt ", attempt, " failed: ",
         error.msg
